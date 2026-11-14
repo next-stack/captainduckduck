@@ -1,9 +1,14 @@
+import { CronJob } from 'cron'
 import * as crypto from 'crypto'
 import { remove } from 'fs-extra'
 import * as yaml from 'yaml'
 import Logger from './Logger'
 
 export default class Utils {
+    static copyObject<T>(obj: T): T {
+        return JSON.parse(JSON.stringify(obj)) as T
+    }
+
     static removeHttpHttps(input: string) {
         input = input.trim()
         input = input.replace(/^(?:http?:\/\/)?/i, '')
@@ -51,7 +56,7 @@ export default class Utils {
     }
 
     static convertYamlOrJsonToObject(raw: string | undefined) {
-        raw = !!raw ? `${raw}`.trim() : ''
+        raw = raw ? `${raw}`.trim() : ''
         if (!raw.length) {
             return undefined
         }
@@ -101,7 +106,7 @@ export default class Utils {
     }
 
     static filterInPlace<T>(arr: T[], condition: (value: T) => boolean) {
-        let newArray = arr.filter(condition)
+        const newArray = arr.filter(condition)
         arr.splice(0, arr.length)
         newArray.forEach((value) => arr.push(value))
     }
@@ -119,7 +124,7 @@ export default class Utils {
         promises: (() => Promise<void>)[],
         curr?: number
     ): Promise<void> {
-        let currCorrected = curr ? curr : 0
+        const currCorrected = curr ? curr : 0
         if (promises.length > currCorrected) {
             return promises[currCorrected]().then(function () {
                 return Utils.runPromises(promises, currCorrected + 1)
@@ -157,5 +162,22 @@ export default class Utils {
         ) {
             throw 'Domain name is not accepted. Custom domain cannot be subdomain of root domain.'
         }
+    }
+
+    static validateCron(schedule: string) {
+        try {
+            const testJob = new CronJob(
+                schedule, // cronTime
+                function () {}, // onTick
+                null, // onComplete
+                false, // start
+                'UTC' // timezone
+            )
+            testJob.stop()
+        } catch (e) {
+            return false
+        }
+
+        return true
     }
 }

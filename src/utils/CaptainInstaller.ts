@@ -1,10 +1,10 @@
-import externalIp = require('public-ip')
 import DockerApi from '../docker/DockerApi'
+import { IAppEnvVar, IAppPort } from '../models/AppDefinition'
 import BackupManager from '../user/system/BackupManager'
 import CaptainConstants from './CaptainConstants'
 import EnvVar from './EnvVars'
+import { getText } from './HttpUtils'
 import http = require('http')
-import request = require('request')
 
 // internal IP returns Public IP if the machine is not behind a NAT
 // No need to directly use Public IP.
@@ -20,46 +20,100 @@ function checkSystemReq() {
             console.log(' ')
             console.log(' >>> Checking System Compatibility <<<')
 
-            let ver = output.Version.split('.')
-            let maj = Number(ver[0])
-            let min = Number(ver[1])
-
-            let versionOk = false
-
-            if (maj > 17) {
-                versionOk = true
-            } else if (maj === 17 && min >= 6) {
-                versionOk = true
-            }
-
-            if (versionOk) {
-                console.log('   Docker Version passed.')
-            } else {
-                console.log(
-                    'Warning!! Minimum Docker version is 17.06.x CapRover may not run properly on your Docker version.'
-                )
-            }
+            console.log('   Docker Version:', output.Version)
 
             return DockerApi.get().getDockerInfo()
         })
         .then(function (output) {
-            if (output.OperatingSystem.toLowerCase().indexOf('ubuntu') < 0) {
+            // Check for known incompatible hosts
+            if (
+                output.KernelVersion &&
+                output.KernelVersion.toLowerCase().includes('-pve')
+            ) {
+                console.log(' ')
+                console.log('******* ERROR *******')
                 console.log(
-                    '******* Warning *******    CapRover and Docker work best on Ubuntu - specially when it comes to storage drivers.'
+                    'CapRover may not work properly on this host (Proxmox LXC containers).'
                 )
-            } else {
-                console.log('   Ubuntu detected.')
+                console.log(
+                    'Proxmox containers are known to break Docker swarm networking.'
+                )
+                console.log(
+                    'Consider using a different virtualization platform.'
+                )
+
+                throw new Error('Host is not compatible with CapRover.')
+            } else if (
+                output.KernelVersion &&
+                !output.KernelVersion.toLowerCase().includes('-generic')
+            ) {
+                console.log('   Kernel version:', output.KernelVersion)
+                console.log(
+                    '   Warning: Non-generic kernel detected. CapRover compatibility may vary.'
+                )
             }
 
-            if (output.Architecture.toLowerCase().indexOf('x86') < 0) {
-                console.log(
-                    '******* Warning *******    Default CapRover is compiled for X86 CPU. To use CapRover on other CPUs you can build from the source code'
-                )
-            } else {
-                console.log('   X86 CPU detected.')
+            // Check operating system
+            if (output.OperatingSystem) {
+                const osLower = output.OperatingSystem.toLowerCase()
+                if (osLower.indexOf('ubuntu') >= 0) {
+                    // Check for Ubuntu 22+ specifically
+                    const ubuntuMatch = osLower.match(/ubuntu\s+(\d+)/)
+                    if (ubuntuMatch) {
+                        const version = parseInt(ubuntuMatch[1])
+                        if (version < 22) {
+                            console.log(
+                                '   Ubuntu detected but version is below 22.'
+                            )
+                            console.log(
+                                '   Warning: Ubuntu 22+ is recommended for best compatibility.'
+                            )
+                        }
+                    } else {
+                        console.log(
+                            'WARNING: Ubuntu detected, but version not found.'
+                        )
+                    }
+                } else {
+                    console.log(
+                        '******* Warning *******    CapRover and Docker work best on Ubuntu - specially when it comes to storage drivers.'
+                    )
+                }
             }
 
-            let totalMemInMb = Math.round(output.MemTotal / 1000.0 / 1000.0)
+            // Check backing filesystem
+            if (output.DriverStatus) {
+                const backingFsMatch = output.DriverStatus.find(
+                    (item: any) => item[0] === 'Backing Filesystem'
+                )
+                if (backingFsMatch) {
+                    const backingFs = backingFsMatch[1]
+                    if (backingFs != 'extfs') {
+                        console.log('   Backing filesystem:', backingFs)
+                        console.log(
+                            '   WARNING: extfs is recommended for best compatibility.'
+                        )
+                    }
+                }
+            }
+
+            // Check userxattr
+            if (output.DriverStatus) {
+                const userxattrMatch = output.DriverStatus.find(
+                    (item: any) => item[0] === 'userxattr'
+                )
+                if (userxattrMatch) {
+                    const userxattr = userxattrMatch[1]
+                    if (userxattr) {
+                        console.log('   userxattr:', userxattr)
+                        console.log(
+                            '   Warning: userxattr should be false for best compatibility.'
+                        )
+                    }
+                }
+            }
+
+            const totalMemInMb = Math.round(output.MemTotal / 1000.0 / 1000.0)
 
             if (totalMemInMb < 1000) {
                 console.log(
@@ -107,7 +161,7 @@ function startServerOnPort_80_443_3000() {
             })
             res.write(FIREWALL_PASSED)
             res.end()
-        }).listen(3000)
+        }).listen(CaptainConstants.serviceContainerPort3000)
 
         return new Promise<void>(function (resolve) {
             setTimeout(function () {
@@ -126,7 +180,7 @@ function checkPortOrThrow(ipAddr: string, portToTest: number) {
         console.log(' ')
         console.log(' ')
         console.log(
-            'Are your trying to run CapRover on a local machine or a machine without public IP?'
+            'Are you trying to run CapRover on a local machine or a machine without a public IP?'
         )
         console.log(
             'In that case, you need to add this to your installation command:'
@@ -174,9 +228,8 @@ function checkPortOrThrow(ipAddr: string, portToTest: number) {
             reject(new Error(`Port timed out: ${portToTest}`))
         }, 5000)
 
-        request(
-            `http://${ipAddr}:${portToTest}`,
-            function (error, response, body) {
+        getText(`http://${ipAddr}:${portToTest}`)
+            .then(function (body) {
                 if (finished) {
                     return
                 }
@@ -189,8 +242,16 @@ function checkPortOrThrow(ipAddr: string, portToTest: number) {
                     printError()
                     reject(new Error(`Port seems to be closed: ${portToTest}`))
                 }
-            }
-        )
+            })
+            .catch(function () {
+                if (finished) {
+                    return
+                }
+
+                finished = true
+                printError()
+                reject(new Error(`Port seems to be closed: ${portToTest}`))
+            })
     })
 }
 
@@ -206,10 +267,28 @@ function printTroubleShootingUrl() {
 
 let myIp4: string
 
+async function initializeExternalIp() {
+    const externalIp = await import('public-ip')
+    return externalIp
+}
+
 export function install() {
     const backupManger = new BackupManager()
 
     Promise.resolve()
+        .then(function () {
+            if (!EnvVar.ACCEPTED_TERMS) {
+                throw new Error(
+                    `
+                Add the following to the installer line:
+                -e ACCEPTED_TERMS=true
+                
+                Terms of service must be accepted before installation, view them here: 
+                https://github.com/caprover/caprover/blob/master/TERMS_AND_CONDITIONS.md
+                `.trim()
+                )
+            }
+        })
         .then(function () {
             printTroubleShootingUrl()
         })
@@ -217,11 +296,26 @@ export function install() {
             return checkSystemReq()
         })
         .then(function () {
+            return initializeExternalIp()
+        })
+        .then(function (externalIp) {
             if (EnvVar.MAIN_NODE_IP_ADDRESS) {
                 return EnvVar.MAIN_NODE_IP_ADDRESS
             }
 
-            return externalIp.v4()
+            try {
+                const externalIpFetched = externalIp.publicIpv4()
+                if (externalIpFetched) {
+                    return externalIpFetched
+                }
+            } catch (error) {
+                console.error(
+                    'Defaulting to 127.0.0.1 - Error retrieving IP address:',
+                    error
+                )
+            }
+
+            return '127.0.0.1'
         })
         .then(function (ip4) {
             if (!ip4) {
@@ -255,13 +349,22 @@ export function install() {
             return startServerOnPort_80_443_3000()
         })
         .then(function () {
-            return checkPortOrThrow(myIp4, 80)
+            return checkPortOrThrow(
+                myIp4,
+                CaptainConstants.configs.nginxPortNumber80 as any
+            )
         })
         .then(function () {
-            return checkPortOrThrow(myIp4, 443)
+            return checkPortOrThrow(
+                myIp4,
+                CaptainConstants.configs.nginxPortNumber443 as any
+            )
         })
         .then(function () {
-            return checkPortOrThrow(myIp4, 3000)
+            return checkPortOrThrow(
+                myIp4,
+                CaptainConstants.configs.adminPortNumber3000 as any
+            )
         })
         .then(function () {
             const imageName = CaptainConstants.configs.nginxImageName
@@ -274,7 +377,7 @@ export function install() {
             return DockerApi.get().pullImage(imageName, undefined)
         })
         .then(function () {
-            const imageName = CaptainConstants.certbotImageName
+            const imageName = CaptainConstants.configs.certbotImageName
             console.log(`Pulling: ${imageName}`)
             return DockerApi.get().pullImage(imageName, undefined)
         })
@@ -282,6 +385,9 @@ export function install() {
             return backupManger.checkAndPrepareRestoration()
         })
         .then(function () {
+            if (CaptainConstants.configs.useExistingSwarm) {
+                return DockerApi.get().ensureSwarmExists()
+            }
             return DockerApi.get().initSwarm(myIp4)
         })
         .then(function (swarmId: string) {
@@ -292,17 +398,29 @@ export function install() {
             return DockerApi.get().getLeaderNodeId()
         })
         .then(function (nodeId: string) {
-            let volumeToMount = [
+            const volumeToMount = [
                 {
                     hostPath: CaptainConstants.captainBaseDirectory,
                     containerPath: CaptainConstants.captainBaseDirectory,
                 },
             ]
 
-            let env = [] as IAppEnvVar[]
+            const env = [] as IAppEnvVar[]
             env.push({
                 key: EnvVar.keys.IS_CAPTAIN_INSTANCE,
                 value: '1',
+            })
+            env.push({
+                key: EnvVar.keys.CAPTAIN_HOST_ADMIN_PORT,
+                value: CaptainConstants.configs.adminPortNumber3000 + '',
+            })
+            env.push({
+                key: EnvVar.keys.CAPTAIN_HOST_HTTP_PORT,
+                value: CaptainConstants.configs.nginxPortNumber80 + '',
+            })
+            env.push({
+                key: EnvVar.keys.CAPTAIN_HOST_HTTPS_PORT,
+                value: CaptainConstants.configs.nginxPortNumber443 + '',
             })
 
             if (EnvVar.DEFAULT_PASSWORD) {
@@ -324,7 +442,14 @@ export function install() {
                 })
             }
 
-            let ports: IAppPort[] = []
+            if (EnvVar.CAPTAIN_BASE_DIRECTORY) {
+                env.push({
+                    key: EnvVar.keys.CAPTAIN_BASE_DIRECTORY,
+                    value: EnvVar.CAPTAIN_BASE_DIRECTORY,
+                })
+            }
+
+            const ports: IAppPort[] = []
 
             let captainNameAndVersion = `${CaptainConstants.configs.publishedNameOnDockerHub}:${CaptainConstants.configs.version}`
 
@@ -350,8 +475,9 @@ export function install() {
 
             ports.push({
                 protocol: 'tcp',
-                containerPort: CaptainConstants.captainServiceExposedPort,
-                hostPort: CaptainConstants.captainServiceExposedPort,
+                publishMode: 'host',
+                containerPort: CaptainConstants.serviceContainerPort3000,
+                hostPort: CaptainConstants.configs.adminPortNumber3000,
             })
 
             return DockerApi.get().createServiceOnNodeId(

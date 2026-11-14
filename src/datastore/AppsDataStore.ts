@@ -1,5 +1,18 @@
 import { v4 as uuid } from 'uuid'
 import ApiStatusCodes from '../api/ApiStatusCodes'
+import {
+    AppDeployTokenConfig,
+    IAllAppDefinitions,
+    IAppDef,
+    IAppDefSaved,
+    IAppEnvVar,
+    IAppPort,
+    IAppTag,
+    IAppVersion,
+    IAppVolume,
+    IHttpAuth,
+    RepoInfo,
+} from '../models/AppDefinition'
 import { IBuiltImage } from '../models/IBuiltImage'
 import Authenticator from '../user/Authenticator'
 import ApacheMd5 from '../utils/ApacheMd5'
@@ -9,19 +22,48 @@ import Logger from '../utils/Logger'
 import Utils from '../utils/Utils'
 import configstore = require('configstore')
 
-const isValidPath = require('is-valid-path')
+import isValidPath = require('is-valid-path')
 
 const APP_DEFINITIONS = 'appDefinitions'
 
-function isNameAllowed(name: string) {
+export function isNameAllowed(name: string) {
     const isNameFormattingOk =
         !!name &&
         name.length < 50 &&
-        /^[a-z]/.test(name) &&
+        /^[a-z0-9]/.test(name) &&
         /[a-z0-9]$/.test(name) &&
         /^[a-z0-9\-]+$/.test(name) &&
         name.indexOf('--') < 0
-    return isNameFormattingOk && ['captain', 'registry'].indexOf(name) < 0
+    return (
+        isNameFormattingOk &&
+        ['captain', 'registry'].indexOf(name) < 0 &&
+        !name.startsWith('captain-')
+    )
+}
+
+/**
+ * Checks valid docker volume names
+ * @param name
+ * @returns {boolean}
+ *
+ * According to Docker documentation:
+ * A volume name must be valid ASCII and may contain lowercase and uppercase letters, digits, underscores, periods and dashes.
+ * A volume name may not start with a period or a dash and may not contain consecutive periods or dashes.
+ * The maximum length is 255 characters.
+ * https://docs.docker.com/engine/reference/commandline/volume_create/#create-a-volume
+ * example valid names: my-volume, My.Volume, my_volume, myvolume123, my.volume-name_123, myvolume
+ * example invalid names: -myvolume, .myvolume, my..volume, my--volume, my volume (space), my@volume, (special characters)
+ */
+export function isDockerVolumeNameAllowed(name: string) {
+    const isNameFormattingOk =
+        !!name &&
+        name.length < 256 &&
+        /^[a-zA-Z0-9]/.test(name) &&
+        /[a-zA-Z0-9]$/.test(name) &&
+        /^[a-zA-Z0-9_.-]+$/.test(name) &&
+        name.indexOf('..') < 0 &&
+        name.indexOf('--') < 0
+    return isNameFormattingOk
 }
 
 function isPortValid(portNumber: number) {
@@ -31,13 +73,16 @@ function isPortValid(portNumber: number) {
 class AppsDataStore {
     private encryptor: CaptainEncryptor
 
-    constructor(private data: configstore, private namepace: string) {}
+    constructor(
+        private data: configstore,
+        private namepace: string
+    ) {}
 
     setEncryptor(encryptor: CaptainEncryptor) {
         this.encryptor = encryptor
     }
 
-    private saveApp(appName: String, app: IAppDef) {
+    private saveApp(appName: string, app: IAppDef) {
         const self = this
 
         return Promise.resolve()
@@ -47,6 +92,18 @@ class AppsDataStore {
                         ApiStatusCodes.STATUS_ERROR_GENERIC,
                         'App Name should not be empty'
                     )
+                }
+
+                const existingApp = self.data.get(
+                    `${APP_DEFINITIONS}.${appName}`
+                ) as IAppDefSaved | undefined
+
+                if (existingApp) {
+                    if (existingApp.isLegacyAppName === undefined) {
+                        delete app.isLegacyAppName
+                    } else {
+                        app.isLegacyAppName = existingApp.isLegacyAppName
+                    }
                 }
 
                 if (app.forceSsl) {
@@ -146,7 +203,7 @@ class AppsDataStore {
                         } else {
                             if (
                                 !obj.volumeName ||
-                                !isNameAllowed(obj.volumeName)
+                                !isDockerVolumeNameAllowed(obj.volumeName)
                             ) {
                                 throw ApiStatusCodes.createError(
                                     ApiStatusCodes.STATUS_ERROR_GENERIC,
@@ -160,7 +217,7 @@ class AppsDataStore {
             .then(function () {
                 let passwordToBeEncrypted = ''
                 let sshKeyToBeEncrypted = ''
-                let pushWebhook = app.appPushWebhook
+                const pushWebhook = app.appPushWebhook
                 if (
                     pushWebhook &&
                     pushWebhook.pushWebhookToken &&
@@ -173,23 +230,18 @@ class AppsDataStore {
                     sshKeyToBeEncrypted = pushWebhook.repoInfo.sshKey || ''
                     pushWebhook.repoInfo.password = ''
                     pushWebhook.repoInfo.sshKey = ''
-                } else {
-                    // some required data is missing. We drop the push data
-                    pushWebhook = undefined
                 }
 
                 const appToSave: IAppDefSaved = <IAppDefSaved>app
 
                 if (passwordToBeEncrypted) {
-                    appToSave.appPushWebhook!.repoInfo!.passwordEncrypted = self.encryptor.encrypt(
-                        passwordToBeEncrypted
-                    )
+                    appToSave.appPushWebhook!.repoInfo!.passwordEncrypted =
+                        self.encryptor.encrypt(passwordToBeEncrypted)
                 }
 
                 if (sshKeyToBeEncrypted) {
-                    appToSave.appPushWebhook!.repoInfo!.sshKeyEncrypted = self.encryptor.encrypt(
-                        sshKeyToBeEncrypted
-                    )
+                    appToSave.appPushWebhook!.repoInfo!.sshKeyEncrypted =
+                        self.encryptor.encrypt(sshKeyToBeEncrypted)
                 }
 
                 return appToSave
@@ -203,11 +255,11 @@ class AppsDataStore {
         if (!isNameAllowed(appName)) {
             throw ApiStatusCodes.createError(
                 ApiStatusCodes.STATUS_ERROR_BAD_NAME,
-                'App Name is not allowed. Only lowercase letters and single hyphens are allowed'
+                'App Name is not allowed. Only lowercase letters, numbers and single hyphens are allowed, up to 49 characters'
             )
         }
 
-        if (!!this.data.get(`${APP_DEFINITIONS}.${appName}`)) {
+        if (this.data.get(`${APP_DEFINITIONS}.${appName}`)) {
             throw ApiStatusCodes.createError(
                 ApiStatusCodes.STATUS_ERROR_ALREADY_EXIST,
                 'App Name already exists. Please use a different name'
@@ -255,19 +307,27 @@ class AppsDataStore {
             })
     }
 
-    getServiceName(appName: string) {
-        return `srv-${this.namepace}--${appName}`
+    getServiceName(appName: string, isLegacyAppName: boolean) {
+        if (isLegacyAppName) {
+            return `srv-${this.namepace}--${appName}`
+        }
+
+        return `${appName}`
     }
 
-    getVolumeName(volumeName: string) {
-        return `${this.namepace}--${volumeName}`
+    getVolumeName(volumeName: string, isLegacyVolumeName: boolean) {
+        if (isLegacyVolumeName) {
+            return `${this.namepace}--${volumeName}`
+        }
+
+        return volumeName
     }
 
     getAppDefinitions() {
         const self = this
         return new Promise<IAllAppDefinitions>(function (resolve, reject) {
-            let allApps = self.data.get(APP_DEFINITIONS) || {}
-            let allAppsUnencrypted: IAllAppDefinitions = {}
+            const allApps = self.data.get(APP_DEFINITIONS) || {}
+            const allAppsUnencrypted: IAllAppDefinitions = {}
 
             Object.keys(allApps).forEach(function (appName) {
                 allAppsUnencrypted[appName] = allApps[appName]
@@ -389,7 +449,7 @@ class AppsDataStore {
         })
     }
 
-    removeCustomDomainForApp(appName: string, customDomain: string) {
+    removeCustomDomainForApp(appName: string, customDomainToRemove: string) {
         const self = this
 
         return this.getAppDefinition(appName).then(function (app) {
@@ -398,7 +458,9 @@ class AppsDataStore {
             const newDomains = []
             let removed = false
             for (let idx = 0; idx < app.customDomain.length; idx++) {
-                if (app.customDomain[idx].publicDomain === customDomain) {
+                if (
+                    app.customDomain[idx].publicDomain === customDomainToRemove
+                ) {
                     removed = true
                 } else {
                     newDomains.push(app.customDomain[idx])
@@ -408,8 +470,17 @@ class AppsDataStore {
             if (!removed) {
                 throw ApiStatusCodes.createError(
                     ApiStatusCodes.STATUS_ERROR_GENERIC,
-                    `Custom domain ${customDomain} does not exist in ${appName}`
+                    `Custom domain ${customDomainToRemove} does not exist in ${appName}`
                 )
+            }
+
+            if (app.redirectDomain) {
+                if (`${app.redirectDomain}` === customDomainToRemove) {
+                    app.redirectDomain = undefined
+                }
+                if (newDomains.length === 0) {
+                    app.redirectDomain = undefined
+                }
             }
 
             app.customDomain = newDomains
@@ -420,26 +491,54 @@ class AppsDataStore {
     addCustomDomainForApp(appName: string, customDomain: string) {
         const self = this
 
-        return this.getAppDefinition(appName).then(function (app) {
-            app.customDomain = app.customDomain || []
+        return this.ensureCustomDomainIsAvailable(appName, customDomain)
+            .then(function () {
+                return self.getAppDefinition(appName)
+            })
+            .then(function (app) {
+                app.customDomain = app.customDomain || []
 
-            if (app.customDomain.length > 0) {
-                for (let idx = 0; idx < app.customDomain.length; idx++) {
-                    if (app.customDomain[idx].publicDomain === customDomain) {
-                        throw ApiStatusCodes.createError(
-                            ApiStatusCodes.ILLEGAL_PARAMETER,
-                            `App already has customDomain: ${customDomain} attached to app ${appName}`
-                        )
+                if (app.customDomain.length > 0) {
+                    for (let idx = 0; idx < app.customDomain.length; idx++) {
+                        if (
+                            app.customDomain[idx].publicDomain === customDomain
+                        ) {
+                            throw ApiStatusCodes.createError(
+                                ApiStatusCodes.ILLEGAL_PARAMETER,
+                                `App already has customDomain: ${customDomain} attached to app ${appName}`
+                            )
+                        }
                     }
                 }
-            }
 
-            app.customDomain.push({
-                publicDomain: customDomain,
-                hasSsl: false,
+                app.customDomain.push({
+                    publicDomain: customDomain,
+                    hasSsl: false,
+                })
+
+                return self.saveApp(appName, app)
             })
+    }
 
-            return self.saveApp(appName, app)
+    ensureCustomDomainIsAvailable(appName: string, customDomain: string) {
+        return this.getAppDefinitions().then(function (apps) {
+            for (const existingAppName of Object.keys(apps)) {
+                if (existingAppName === appName) continue
+
+                const domainOwner = (
+                    apps[existingAppName].customDomain || []
+                ).find(
+                    (domain) =>
+                        domain.publicDomain.toLowerCase() ===
+                        customDomain.toLowerCase()
+                )
+                if (domainOwner) {
+                    throw ApiStatusCodes.createError(
+                        ApiStatusCodes.ILLEGAL_PARAMETER,
+                        `Custom domain ${customDomain} is already attached to app ${existingAppName}`
+                    )
+                }
+            }
         })
     }
 
@@ -602,11 +701,13 @@ class AppsDataStore {
 
     updateAppDefinitionInDb(
         appName: string,
+        projectId: string | undefined,
         description: string,
         instanceCount: number,
         captainDefinitionRelativeFilePath: string,
         envVars: IAppEnvVar[],
         volumes: IAppVolume[],
+        tags: IAppTag[],
         nodeId: string,
         notExposeAsWebApp: boolean,
         containerHttpPort: number,
@@ -616,6 +717,7 @@ class AppsDataStore {
         repoInfo: RepoInfo,
         authenticator: Authenticator,
         customNginxConfig: string,
+        redirectDomain: string,
         preDeployFunction: string,
         serviceUpdateOverride: string,
         websocketSupport: boolean,
@@ -690,9 +792,12 @@ class AppsDataStore {
                 appObj.websocketSupport = !!websocketSupport
                 appObj.nodeId = nodeId
                 appObj.customNginxConfig = customNginxConfig
+                appObj.redirectDomain = redirectDomain
                 appObj.preDeployFunction = preDeployFunction
                 appObj.serviceUpdateOverride = serviceUpdateOverride
                 appObj.description = description
+                appObj.projectId = projectId
+                appObj.tags = tags
 
                 appObj.appDeployTokenConfig = {
                     enabled: !!appDeployTokenConfig.enabled,
@@ -716,9 +821,8 @@ class AppsDataStore {
                     appObj.appDeployTokenConfig.appDeployToken = undefined
                 } else if (!appObj.appDeployTokenConfig.appDeployToken) {
                     // App is supposed to have a token, but it doesn't have one yet. The first time use case.
-                    appObj.appDeployTokenConfig.appDeployToken = Utils.generateRandomString(
-                        32
-                    )
+                    appObj.appDeployTokenConfig.appDeployToken =
+                        Utils.generateRandomString(32)
                 }
 
                 if (httpAuth && httpAuth.user) {
@@ -753,6 +857,10 @@ class AppsDataStore {
                         appObj.ports.push({
                             hostPort: hostPort,
                             containerPort: containerPort,
+                            ...(obj.protocol ? { protocol: obj.protocol } : {}),
+                            ...(obj.publishMode
+                                ? { publishMode: obj.publishMode }
+                                : {}),
                         })
                     }
                 }
@@ -814,16 +922,6 @@ class AppsDataStore {
         const self = this
 
         return new Promise<void>(function (resolve, reject) {
-            if (!isNameAllowed(appName)) {
-                reject(
-                    ApiStatusCodes.createError(
-                        ApiStatusCodes.STATUS_ERROR_BAD_NAME,
-                        'App Name is not allowed. Only lowercase letters and single hyphens are allowed'
-                    )
-                )
-                return
-            }
-
             if (!self.data.get(`${APP_DEFINITIONS}.${appName}`)) {
                 reject(
                     ApiStatusCodes.createError(
@@ -848,7 +946,11 @@ class AppsDataStore {
      * @param hasPersistentData         whether the app has persistent data, you can only run one instance of the app.
      * @returns {Promise}
      */
-    registerAppDefinition(appName: string, hasPersistentData: boolean) {
+    registerAppDefinition(
+        appName: string,
+        projectId: string | undefined,
+        hasPersistentData: boolean
+    ) {
         const self = this
 
         return new Promise<IAppDef>(function (resolve, reject) {
@@ -856,13 +958,13 @@ class AppsDataStore {
                 reject(
                     ApiStatusCodes.createError(
                         ApiStatusCodes.STATUS_ERROR_BAD_NAME,
-                        'App Name is not allowed. Only lowercase letters and single hyphens are allowed'
+                        'App Name is not allowed. Only lowercase letters, numbers and single hyphens are allowed, up to 49 characters'
                     )
                 )
                 return
             }
 
-            if (!!self.data.get(`${APP_DEFINITIONS}.${appName}`)) {
+            if (self.data.get(`${APP_DEFINITIONS}.${appName}`)) {
                 reject(
                     ApiStatusCodes.createError(
                         ApiStatusCodes.STATUS_ERROR_ALREADY_EXIST,
@@ -874,6 +976,7 @@ class AppsDataStore {
 
             const defaultAppDefinition: IAppDef = {
                 hasPersistentData: !!hasPersistentData,
+                projectId: projectId,
                 description: '',
                 instanceCount: 1,
                 captainDefinitionRelativeFilePath:
@@ -882,13 +985,15 @@ class AppsDataStore {
                 envVars: [],
                 volumes: [],
                 ports: [],
+                tags: [],
                 versions: [],
                 deployedVersion: 0,
                 notExposeAsWebApp: false,
                 customDomain: [],
                 hasDefaultSubDomainSsl: false,
+                redirectDomain: '',
                 forceSsl: false,
-                websocketSupport: false,
+                websocketSupport: true,
             }
 
             resolve(defaultAppDefinition)

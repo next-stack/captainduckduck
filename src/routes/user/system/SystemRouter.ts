@@ -1,20 +1,26 @@
 import express = require('express')
+import fs from 'fs/promises'
+import path from 'path'
 import validator from 'validator'
 import ApiStatusCodes from '../../../api/ApiStatusCodes'
 import BaseApi from '../../../api/BaseApi'
 import DockerApi from '../../../docker/DockerApi'
 import DockerUtils from '../../../docker/DockerUtils'
 import InjectionExtractor from '../../../injection/InjectionExtractor'
+import { IAppDef } from '../../../models/AppDefinition'
+import { AutomatedCleanupConfigsCleaner } from '../../../models/AutomatedCleanupConfigs'
 import CaptainManager from '../../../user/system/CaptainManager'
 import VersionManager from '../../../user/system/VersionManager'
 import CaptainConstants from '../../../utils/CaptainConstants'
 import Logger from '../../../utils/Logger'
 import Utils from '../../../utils/Utils'
+import ThemesRouter from './ThemesRouter'
 import SystemRouteSelfHostRegistry from './selfhostregistry/SystemRouteSelfHostRegistry'
 
 const router = express.Router()
 
 router.use('/selfhostregistry/', SystemRouteSelfHostRegistry)
+router.use('/themes/', ThemesRouter)
 
 router.post('/createbackup/', function (req, res, next) {
     const backupManager = CaptainManager.get().getBackupManager()
@@ -35,7 +41,7 @@ router.post('/createbackup/', function (req, res, next) {
 })
 
 router.post('/changerootdomain/', function (req, res, next) {
-    let requestedCustomDomain = Utils.removeHttpHttps(
+    const requestedCustomDomain = Utils.removeHttpHttps(
         (req.body.rootDomain || '').toLowerCase()
     )
 
@@ -101,7 +107,7 @@ router.post('/enablessl/', function (req, res, next) {
 })
 
 router.post('/forcessl/', function (req, res, next) {
-    let isEnabled = !!req.body.isEnabled
+    const isEnabled = !!req.body.isEnabled
 
     CaptainManager.get()
         .forceSsl(isEnabled)
@@ -119,8 +125,8 @@ router.post('/forcessl/', function (req, res, next) {
 })
 
 router.get('/info/', function (req, res, next) {
-    const dataStore = InjectionExtractor.extractUserFromInjected(res).user
-        .dataStore
+    const dataStore =
+        InjectionExtractor.extractUserFromInjected(res).user.dataStore
 
     return Promise.resolve()
         .then(function () {
@@ -133,10 +139,11 @@ router.get('/info/', function (req, res, next) {
                 rootDomain: dataStore.hasCustomDomain()
                     ? dataStore.getRootDomain()
                     : '',
+                captainSubDomain: CaptainConstants.configs.captainSubDomain,
             }
         })
         .then(function (data) {
-            let baseApi = new BaseApi(
+            const baseApi = new BaseApi(
                 ApiStatusCodes.STATUS_OK,
                 'Captain info retrieved'
             )
@@ -152,7 +159,7 @@ router.get('/loadbalancerinfo/', function (req, res, next) {
             return CaptainManager.get().getLoadBalanceManager().getInfo()
         })
         .then(function (data) {
-            let baseApi = new BaseApi(
+            const baseApi = new BaseApi(
                 ApiStatusCodes.STATUS_OK,
                 'Load Balancer info retrieved'
             )
@@ -168,7 +175,7 @@ router.get('/versionInfo/', function (req, res, next) {
             return VersionManager.get().getCaptainImageTags()
         })
         .then(function (data) {
-            let baseApi = new BaseApi(
+            const baseApi = new BaseApi(
                 ApiStatusCodes.STATUS_OK,
                 'Version Info Retrieved'
             )
@@ -179,14 +186,21 @@ router.get('/versionInfo/', function (req, res, next) {
 })
 
 router.post('/versionInfo/', function (req, res, next) {
-    let latestVersion = req.body.latestVersion
+    const latestVersion = req.body.latestVersion
+    const registryHelper =
+        InjectionExtractor.extractUserFromInjected(
+            res
+        ).user.serviceManager.getRegistryHelper()
 
     return Promise.resolve()
         .then(function () {
-            return VersionManager.get().updateCaptain(latestVersion)
+            return VersionManager.get().updateCaptain(
+                latestVersion,
+                registryHelper
+            )
         })
         .then(function () {
-            let baseApi = new BaseApi(
+            const baseApi = new BaseApi(
                 ApiStatusCodes.STATUS_OK,
                 'Captain update process has started...'
             )
@@ -195,9 +209,71 @@ router.post('/versionInfo/', function (req, res, next) {
         .catch(ApiStatusCodes.createCatcher(res))
 })
 
+router.get('/diskusage/', function (req, res, next) {
+    return Promise.resolve()
+        .then(function () {
+            return CaptainManager.get().getDiskUsage()
+        })
+        .then(function (data) {
+            const baseApi = new BaseApi(
+                ApiStatusCodes.STATUS_OK,
+                'Disk usage retrieved'
+            )
+            baseApi.data = data
+            res.send(baseApi)
+        })
+        .catch(function (error) {
+            Logger.e(error, 'Unable to retrieve disk usage')
+            res.send(
+                new BaseApi(
+                    ApiStatusCodes.STATUS_ERROR_GENERIC,
+                    'Unable to retrieve disk usage'
+                )
+            )
+        })
+})
+
+router.get('/diskcleanup/', function (req, res, next) {
+    return Promise.resolve()
+        .then(function () {
+            return CaptainManager.get().getDiskCleanupManager().getConfigs()
+        })
+        .then(function (data) {
+            const baseApi = new BaseApi(
+                ApiStatusCodes.STATUS_OK,
+                'Disk cleanup configs retrieved'
+            )
+            baseApi.data = data
+            res.send(baseApi)
+        })
+        .catch(ApiStatusCodes.createCatcher(res))
+})
+
+router.post('/diskcleanup/', function (req, res, next) {
+    return Promise.resolve()
+        .then(function () {
+            const configs = AutomatedCleanupConfigsCleaner.sanitizeInput({
+                mostRecentLimit: req.body.mostRecentLimit,
+                cronSchedule: req.body.cronSchedule,
+                timezone: req.body.timezone,
+            })
+            return CaptainManager.get()
+                .getDiskCleanupManager()
+                .setConfig(configs)
+        })
+        .then(function () {
+            const baseApi = new BaseApi(
+                ApiStatusCodes.STATUS_OK,
+                'Disk cleanup configs updated'
+            )
+            res.send(baseApi)
+        })
+        .catch(ApiStatusCodes.createCatcher(res))
+})
+
 router.get('/netdata/', function (req, res, next) {
-    const dataStore = InjectionExtractor.extractUserFromInjected(res).user
-        .dataStore
+    const dataStore =
+        InjectionExtractor.extractUserFromInjected(res).user.dataStore
 
     return Promise.resolve()
         .then(function () {
@@ -209,7 +285,7 @@ router.get('/netdata/', function (req, res, next) {
             }.${dataStore.getRootDomain()}${
                 CaptainConstants.netDataRelativePath
             }`
-            let baseApi = new BaseApi(
+            const baseApi = new BaseApi(
                 ApiStatusCodes.STATUS_OK,
                 'Netdata info retrieved'
             )
@@ -220,7 +296,7 @@ router.get('/netdata/', function (req, res, next) {
 })
 
 router.post('/netdata/', function (req, res, next) {
-    let netDataInfo = req.body.netDataInfo
+    const netDataInfo = req.body.netDataInfo
     netDataInfo.netDataUrl = undefined // Frontend app returns this value, but we really don't wanna save this.
     // root address is subject to change.
 
@@ -229,7 +305,7 @@ router.post('/netdata/', function (req, res, next) {
             return CaptainManager.get().updateNetDataInfo(netDataInfo)
         })
         .then(function () {
-            let baseApi = new BaseApi(
+            const baseApi = new BaseApi(
                 ApiStatusCodes.STATUS_OK,
                 'Netdata info is updated'
             )
@@ -238,13 +314,226 @@ router.post('/netdata/', function (req, res, next) {
         .catch(ApiStatusCodes.createCatcher(res))
 })
 
+router.get('/goaccess/', function (req, res, next) {
+    const dataStore =
+        InjectionExtractor.extractUserFromInjected(res).user.dataStore
+
+    return Promise.resolve()
+        .then(function () {
+            return dataStore.getGoAccessInfo()
+        })
+        .then(function (goAccessInfo) {
+            const baseApi = new BaseApi(
+                ApiStatusCodes.STATUS_OK,
+                'GoAccess info retrieved'
+            )
+            baseApi.data = goAccessInfo
+            res.send(baseApi)
+        })
+        .catch(ApiStatusCodes.createCatcher(res))
+})
+
+router.post('/goaccess/', function (req, res, next) {
+    const goAccessInfo = req.body.goAccessInfo
+
+    return Promise.resolve()
+        .then(function () {
+            return CaptainManager.get().updateGoAccessInfo(goAccessInfo)
+        })
+        .then(function () {
+            const baseApi = new BaseApi(
+                ApiStatusCodes.STATUS_OK,
+                'GoAccess info is updated'
+            )
+            res.send(baseApi)
+        })
+        .catch(ApiStatusCodes.createCatcher(res))
+})
+
+router.get('/goaccess/:appName/files', async function (req, res, next) {
+    const dataStore =
+        InjectionExtractor.extractUserFromInjected(res).user.dataStore
+
+    const goAccessInfo = await dataStore.getGoAccessInfo()
+    const loadBalanceManager = CaptainManager.get().getLoadBalanceManager()
+
+    const appName = req.params.appName
+
+    if (!appName) {
+        const baseApi = new BaseApi(
+            ApiStatusCodes.STATUS_ERROR_GENERIC,
+            'Invalid appName'
+        )
+        baseApi.data = []
+        res.send(baseApi)
+        return
+    }
+
+    if (!goAccessInfo.isEnabled) {
+        const baseApi = new BaseApi(
+            ApiStatusCodes.STATUS_ERROR_GENERIC,
+            'GoAccess not enabled'
+        )
+        baseApi.data = []
+        res.send(baseApi)
+        return
+    }
+
+    const directoryPath = path.join(
+        CaptainConstants.nginxSharedLogsPathOnHost,
+        appName
+    )
+
+    let appDefinition: IAppDef | undefined = undefined
+
+    return Promise.resolve()
+        .then(function () {
+            // Ensure a valid appName parameter
+            return dataStore.getAppsDataStore().getAppDefinition(appName)
+        })
+        .then(function (data) {
+            appDefinition = data
+            return fs.readdir(directoryPath).catch((e) => {
+                Logger.d('No goaccess logs found')
+                return []
+            })
+        })
+        .then(function (files) {
+            return Promise.all(
+                files
+                    // Make sure to only return the generated reports and not folders or the live report
+                    // That will be added back later
+                    .filter(
+                        (f) => f.endsWith('.html') && !f.endsWith('Live.html')
+                    )
+                    .map((file) => {
+                        return fs
+                            .stat(path.join(directoryPath, file))
+                            .then(function (fileStats) {
+                                return {
+                                    name: file,
+                                    time: fileStats.mtime,
+                                }
+                            })
+                    })
+            )
+        })
+        .then(function (linkData) {
+            const baseUrl = `/user/system/goaccess/`
+
+            const baseApi = new BaseApi(
+                ApiStatusCodes.STATUS_OK,
+                'GoAccess info retrieved'
+            )
+            const linkList = linkData.map((d) => {
+                const { domainName, fileName } =
+                    loadBalanceManager.parseLogPath(d.name)
+                return {
+                    domainName,
+                    name: fileName,
+                    lastModifiedTime: d.time,
+                    url: baseUrl + `${appName}/files/${d.name}`,
+                }
+            })
+
+            // Add in the live report for all sites even if it might not exist yet since they're dynamic
+            const allDomains = [
+                `${appName}.${dataStore.getRootDomain()}`,
+                ...appDefinition!.customDomain.map((d) => d.publicDomain),
+            ]
+            for (const domain of allDomains) {
+                const name =
+                    loadBalanceManager.getLogName(appName, domain) +
+                    '--Live.html'
+                linkList.push({
+                    domainName: domain,
+                    name,
+                    lastModifiedTime: new Date(),
+                    url: baseUrl + `${appName}/files/${name}`,
+                })
+            }
+
+            linkList.sort(
+                (a, b) =>
+                    b.lastModifiedTime.getTime() - a.lastModifiedTime.getTime()
+            )
+
+            baseApi.data = linkList
+
+            res.send(baseApi)
+        })
+        .catch(ApiStatusCodes.createCatcher(res))
+})
+
+router.get('/goaccess/:appName/files/:file', async function (req, res, next) {
+    const { appName, file } = req.params
+    const { domainName, fileName } = CaptainManager.get()
+        .getLoadBalanceManager()
+        .parseLogPath(file)
+    if (fileName.includes('Live')) {
+        // Dynamically update the live reports by running the catchup script for the particular domain
+        await DockerApi.get().createContainer({
+            imageName: CaptainConstants.configs.goAccessImageName,
+            command: ['./catchupLog.sh'],
+            volumes: [
+                {
+                    hostPath: CaptainConstants.nginxSharedLogsPathOnHost,
+                    containerPath: CaptainConstants.nginxSharedLogsPath,
+                    mode: 'rw',
+                },
+            ],
+            network: CaptainConstants.captainNetworkName,
+            arrayOfEnvKeyAndValue: [
+                {
+                    key: 'FILE_PREFIX',
+                    value: `${appName}--${domainName}`,
+                },
+                {
+                    key: 'ANONYMIZE_IP',
+                    value: CaptainConstants.configs.goAccessAnonymizeIP.toString(),
+                },
+            ],
+            sticky: false,
+            wait: true,
+        })
+    }
+
+    const fileRelativePath = `${appName}/${file}`
+    const absolutePath = path.join(
+        CaptainConstants.nginxSharedLogsPathOnHost,
+        appName,
+        file
+    )
+
+    return Promise.resolve()
+        .then(function () {
+            return fs.readFile(absolutePath, 'utf8')
+        })
+        .then(function (fileContents) {
+            const baseApi = new BaseApi(
+                ApiStatusCodes.STATUS_OK,
+                'GoAccess report retrieved'
+            )
+            baseApi.data = fileContents
+            res.send(baseApi)
+        })
+        .catch(function (error) {
+            Logger.e(error, 'Error getting GoAccess report ' + fileRelativePath)
+            const baseApi = new BaseApi(
+                ApiStatusCodes.NOT_FOUND,
+                'Report not found'
+            )
+            res.send(baseApi)
+        })
+})
+
 router.get('/nginxconfig/', function (req, res, next) {
     return Promise.resolve()
         .then(function () {
             return CaptainManager.get().getNginxConfig()
         })
         .then(function (data) {
-            let baseApi = new BaseApi(
+            const baseApi = new BaseApi(
                 ApiStatusCodes.STATUS_OK,
                 'Nginx config retrieved'
             )
@@ -255,8 +544,8 @@ router.get('/nginxconfig/', function (req, res, next) {
 })
 
 router.post('/nginxconfig/', function (req, res, next) {
-    let baseConfigCustomValue = req.body.baseConfig.customValue
-    let captainConfigCustomValue = req.body.captainConfig.customValue
+    const baseConfigCustomValue = req.body.baseConfig.customValue
+    const captainConfigCustomValue = req.body.captainConfig.customValue
 
     return Promise.resolve()
         .then(function () {
@@ -266,7 +555,7 @@ router.post('/nginxconfig/', function (req, res, next) {
             )
         })
         .then(function () {
-            let baseApi = new BaseApi(
+            const baseApi = new BaseApi(
                 ApiStatusCodes.STATUS_OK,
                 'Nginx config is updated'
             )
@@ -281,7 +570,7 @@ router.get('/nodes/', function (req, res, next) {
             return CaptainManager.get().getNodesInfo()
         })
         .then(function (data) {
-            let baseApi = new BaseApi(
+            const baseApi = new BaseApi(
                 ApiStatusCodes.STATUS_OK,
                 'Node info retrieved'
             )
@@ -294,9 +583,10 @@ router.get('/nodes/', function (req, res, next) {
 router.post('/nodes/', function (req, res, next) {
     const MANAGER = 'manager'
     const WORKER = 'worker'
-    const registryHelper = InjectionExtractor.extractUserFromInjected(
-        res
-    ).user.serviceManager.getRegistryHelper()
+    const registryHelper =
+        InjectionExtractor.extractUserFromInjected(
+            res
+        ).user.serviceManager.getRegistryHelper()
 
     let isManager: boolean
 
@@ -314,11 +604,11 @@ router.post('/nodes/', function (req, res, next) {
         return
     }
 
-    let privateKey = req.body.privateKey
-    let remoteNodeIpAddress = req.body.remoteNodeIpAddress
-    let captainIpAddress = req.body.captainIpAddress
-    let sshPort = parseInt(req.body.sshPort) || 22
-    let sshUser = (req.body.sshUser || 'root').trim()
+    const privateKey = req.body.privateKey
+    const remoteNodeIpAddress = req.body.remoteNodeIpAddress
+    const captainIpAddress = req.body.captainIpAddress
+    const sshPort = parseInt(req.body.sshPort) || 22
+    const sshUser = (req.body.sshUser || 'root').trim()
 
     if (!captainIpAddress || !remoteNodeIpAddress || !privateKey) {
         res.send(
@@ -354,7 +644,7 @@ router.post('/nodes/', function (req, res, next) {
             )
         })
         .then(function () {
-            let msg = 'Docker node is successfully joined.'
+            const msg = 'Docker node is successfully joined.'
             Logger.d(msg)
             res.send(new BaseApi(ApiStatusCodes.STATUS_OK, msg))
         })

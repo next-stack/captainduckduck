@@ -1,18 +1,25 @@
-type IAllAppDefinitions = IHashMapGeneric<IAppDef>
+import { IHashMapGeneric } from './ICacheGeneric'
 
-interface IAppEnvVar {
+export type IAllAppDefinitions = IHashMapGeneric<IAppDef>
+
+export interface IAppEnvVar {
     key: string
     value: string
 }
 
-interface IAppVolume {
+export const enum VolumesTypes {
+    BIND = 'bind',
+    VOLUME = 'volume',
+}
+
+export interface IAppVolume {
     containerPath: string
     volumeName?: string
     hostPath?: string
     mode?: string
 }
 
-interface IAppPort {
+export interface IAppPort {
     containerPort: number
     hostPort: number
     protocol?: 'udp' | 'tcp'
@@ -20,7 +27,7 @@ interface IAppPort {
     publishMode?: 'ingress' | 'host'
 }
 
-interface RepoInfo {
+export interface RepoInfo {
     repo: string
     branch: string
     user: string
@@ -28,7 +35,7 @@ interface RepoInfo {
     password: string
 }
 
-interface RepoInfoEncrypted {
+export interface RepoInfoEncrypted {
     repo: string
     branch: string
     user: string
@@ -36,19 +43,24 @@ interface RepoInfoEncrypted {
     passwordEncrypted: string
 }
 
-interface IAppVersion {
+export interface IAppVersion {
     version: number
     deployedImageName?: string // empty if the deploy is not completed
     timeStamp: string
     gitHash: string | undefined
 }
 
-interface IAppCustomDomain {
+export interface IAppCustomDomain {
     publicDomain: string
     hasSsl: boolean
 }
 
-interface IAppDefinitionBase {
+export interface IAppTag {
+    tagName: string
+}
+
+export interface IAppDefinitionBase {
+    projectId?: string | undefined
     description: string
     deployedVersion: number
     notExposeAsWebApp: boolean
@@ -63,27 +75,33 @@ interface IAppDefinitionBase {
     preDeployFunction?: string
     serviceUpdateOverride?: string
     customNginxConfig?: string
+    redirectDomain?: string
     networks: string[]
     customDomain: IAppCustomDomain[]
+    tags?: IAppTag[]
     ports: IAppPort[]
     volumes: IAppVolume[]
     envVars: IAppEnvVar[]
     versions: IAppVersion[]
     appDeployTokenConfig?: AppDeployTokenConfig
+
+    // True for apps created before v1.15.0
+    // non-existent for apps created on or after v1.15.0
+    isLegacyAppName?: boolean
 }
 
-interface IHttpAuth {
+export interface IHttpAuth {
     user: string
     password?: string
     passwordHashed?: string
 }
 
-interface AppDeployTokenConfig {
+export interface AppDeployTokenConfig {
     enabled: boolean
     appDeployToken?: string
 }
 
-interface IAppDef extends IAppDefinitionBase {
+export interface IAppDef extends IAppDefinitionBase {
     appPushWebhook?: {
         tokenVersion: string
         repoInfo: RepoInfo
@@ -94,7 +112,7 @@ interface IAppDef extends IAppDefinitionBase {
     isAppBuilding?: boolean
 }
 
-interface IAppDefSaved extends IAppDefinitionBase {
+export interface IAppDefSaved extends IAppDefinitionBase {
     appPushWebhook:
         | {
               tokenVersion: string

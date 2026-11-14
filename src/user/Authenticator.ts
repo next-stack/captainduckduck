@@ -1,17 +1,48 @@
 import jwt = require('jsonwebtoken')
-import { v4 as uuid } from 'uuid'
+import { randomBytes } from 'crypto'
 import ApiStatusCodes from '../api/ApiStatusCodes'
+import { IHashMapGeneric } from '../models/ICacheGeneric'
 import { UserJwt } from '../models/UserJwt'
 import CaptainConstants from '../utils/CaptainConstants'
 import EnvVar from '../utils/EnvVars'
 import Logger from '../utils/Logger'
 import bcrypt = require('bcryptjs')
 
-const captainDefaultPassword = EnvVar.DEFAULT_PASSWORD || 'captain42'
+const captainDefaultPassword = EnvVar.DEFAULT_PASSWORD ?? 'captain42'
 
 const COOKIE_AUTH_SUFFIX = 'cookie-'
 const WEBHOOK_APP_PUSH_SUFFIX = '-webhook-app-push'
 const DOWNLOAD_TOKEN = '-download-token'
+
+function generateSecureRandomString(length: number): string {
+    if (length <= 0) {
+        throw new Error('Length must be a positive integer.')
+    }
+
+    const charset =
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+    const charsetLength = charset.length
+
+    // Generate random bytes
+    const randomValues = randomBytes(length)
+
+    // Map the random bytes to characters in the charset
+    let result = ''
+    for (let i = 0; i < length; i++) {
+        const randomIndex = randomValues[i] % charsetLength
+        result += charset[randomIndex]
+    }
+
+    return result
+}
+
+export interface OtpConfig {
+    otpToken: string
+    otpAuthenticator: {
+        // getting around circular dependency
+        isOtpTokenValid: (providedToken: string) => Promise<boolean>
+    }
+}
 
 class Authenticator {
     private encryptionKey: string
@@ -21,14 +52,16 @@ class Authenticator {
     constructor(secret: string, namespace: string) {
         this.encryptionKey = secret + namespace // making encryption key unique per namespace!
         this.namespace = namespace
-        this.tokenVersion = CaptainConstants.isDebug ? 'test' : uuid()
+        this.tokenVersion = CaptainConstants.isDebug
+            ? 'test'
+            : generateSecureRandomString(64)
     }
 
     changepass(oldPass: string, newPass: string, savedHashedPassword: string) {
         const self = this
 
-        oldPass = oldPass || ''
-        newPass = newPass || ''
+        oldPass = oldPass ?? ''
+        newPass = newPass ?? ''
 
         return Promise.resolve()
             .then(function () {
@@ -49,7 +82,7 @@ class Authenticator {
                     )
                 }
 
-                self.tokenVersion = uuid()
+                self.tokenVersion = generateSecureRandomString(64)
 
                 const hashed = bcrypt.hashSync(
                     self.encryptionKey + newPass,
@@ -64,10 +97,14 @@ class Authenticator {
         const self = this
 
         return Promise.resolve().then(function () {
-            password = password || ''
+            password = `${password ?? ''}`
 
             if (!savedHashedPassword) {
                 return captainDefaultPassword === password
+            }
+
+            if (!self.encryptionKey) {
+                throw new Error('Encryption key is not set!')
             }
 
             return bcrypt.compareSync(
@@ -77,8 +114,13 @@ class Authenticator {
         })
     }
 
-    getAuthTokenForCookies(password: string, savedHashedPassword: string) {
+    getAuthTokenForCookies(
+        otpConfig: OtpConfig,
+        password: string,
+        savedHashedPassword: string
+    ) {
         return this.getAuthToken(
+            otpConfig,
             password,
             savedHashedPassword,
             COOKIE_AUTH_SUFFIX
@@ -86,21 +128,36 @@ class Authenticator {
     }
 
     getAuthToken(
+        otpConfig: OtpConfig,
         password: string,
         savedHashedPassword: string,
         keySuffix?: string
     ) {
         const self = this
 
+        // intentionally same error to avoid giving bad actors any hints
+        const INVALID_CREDS_ERROR = 'Invalid credentials'
+
         return Promise.resolve()
             .then(function () {
+                return otpConfig.otpAuthenticator.isOtpTokenValid(
+                    otpConfig.otpToken
+                )
+            })
+            .then(function (otpValid) {
+                if (!otpValid) {
+                    throw ApiStatusCodes.createError(
+                        ApiStatusCodes.STATUS_WRONG_PASSWORD,
+                        INVALID_CREDS_ERROR
+                    )
+                }
                 return self.isPasswordCorrect(password, savedHashedPassword)
             })
             .then(function (isPasswordCorrect) {
                 if (!isPasswordCorrect) {
                     throw ApiStatusCodes.createError(
                         ApiStatusCodes.STATUS_WRONG_PASSWORD,
-                        'Password is incorrect.'
+                        INVALID_CREDS_ERROR
                     )
                 }
 
@@ -128,7 +185,7 @@ class Authenticator {
 
         return new Promise<UserJwt>(function (resolve, reject) {
             jwt.verify(
-                token,
+                `${token}`,
                 self.encryptionKey + (keySuffix ? keySuffix : ''),
                 function (err, rawDecoded: { data: UserJwt }) {
                     if (err) {
@@ -224,19 +281,16 @@ class Authenticator {
         const self = this
         obj.namespace = self.namespace
 
-        return Promise.resolve().then(function () {
-            return jwt.sign(
-                {
-                    data: obj,
-                },
-                self.encryptionKey + (keySuffix ? keySuffix : ''),
-                expiresIn
-                    ? {
-                          expiresIn: expiresIn,
-                      }
-                    : undefined
-            )
-        })
+        return Promise.resolve() //
+            .then(function () {
+                return jwt.sign(
+                    {
+                        data: obj,
+                    },
+                    self.encryptionKey + (keySuffix ?? ''),
+                    expiresIn ? { expiresIn: expiresIn as any } : undefined
+                )
+            })
     }
 
     decodeGenericToken(token: string, keySuffix: string) {
@@ -244,8 +298,8 @@ class Authenticator {
 
         return new Promise<any>(function (resolve, reject) {
             jwt.verify(
-                token,
-                self.encryptionKey + (keySuffix ? keySuffix : ''),
+                `${token}`,
+                self.encryptionKey + (keySuffix ?? ''),
                 function (err, rawDecoded: { data: any }) {
                     if (err) {
                         Logger.e(err)
@@ -282,7 +336,8 @@ class Authenticator {
 
     static setMainSalt(salt: string) {
         if (Authenticator.mainSalt) throw new Error('Salt is already set!!')
-        Authenticator.mainSalt = salt
+        if (!salt) throw new Error('Empty salt!!')
+        Authenticator.mainSalt = `${salt}`
     }
 
     static getAuthenticator(namespace: string): Authenticator {
@@ -294,6 +349,13 @@ class Authenticator {
             )
         }
 
+        if (namespace !== CaptainConstants.rootNameSpace) {
+            throw ApiStatusCodes.createError(
+                ApiStatusCodes.STATUS_ERROR_NOT_AUTHORIZED,
+                'Invalid namespace'
+            )
+        }
+
         if (!authenticatorCache[namespace]) {
             const captainSalt = Authenticator.mainSalt
             if (captainSalt) {
@@ -301,6 +363,8 @@ class Authenticator {
                     captainSalt,
                     namespace
                 )
+            } else {
+                throw new Error('Salt is not set! Cannot create authenticator')
             }
         }
 

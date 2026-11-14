@@ -1,7 +1,30 @@
-import { copy, ensureDir, ensureFile, readJson, removeSync } from 'fs-extra'
+import {
+    lstat,
+    mkdtemp,
+    readFile,
+    readlink,
+    rm,
+    symlink,
+    writeFile,
+} from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import {
+    copy,
+    ensureDir,
+    ensureFile,
+    outputJson,
+    pathExists,
+    readJson,
+    remove,
+    removeSync,
+} from 'fs-extra'
+import * as tar from 'tar'
 import { isDeepStrictEqual } from 'util'
 import { RestoringInfo } from '../src/models/BackupMeta'
-import BackupManager from '../src/user/system/BackupManager'
+import BackupManager, {
+    copyCaptainDataForBackup,
+} from '../src/user/system/BackupManager'
 import CaptainConstants from '../src/utils/CaptainConstants'
 const BACKUP_FILE_PATH_ABSOLUTE = '/captain/backup.tar'
 
@@ -21,72 +44,287 @@ function cleanup() {
         })
 }
 
-beforeEach(() => {
-    return cleanup()
+if (process.env.CI) {
+    beforeEach(() => {
+        return cleanup()
+    })
+
+    afterEach(() => {
+        return cleanup()
+    })
+}
+
+describe('BackupManager.sanitizeHostnameForFilename', () => {
+    test('returns the hostname unchanged when it only contains safe chars', () => {
+        expect(
+            BackupManager.sanitizeHostnameForFilename('captain-prod.example.com')
+        ).toBe('captain-prod.example.com')
+    })
+
+    test('replaces filesystem-unsafe characters with underscores', () => {
+        expect(
+            BackupManager.sanitizeHostnameForFilename('host/with bad?chars')
+        ).toBe('host_with_bad_chars')
+    })
+
+    test('returns an empty string for an empty hostname', () => {
+        expect(BackupManager.sanitizeHostnameForFilename('')).toBe('')
+    })
+
+    test('returns an empty string for an undefined hostname', () => {
+        expect(BackupManager.sanitizeHostnameForFilename(undefined)).toBe('')
+    })
 })
 
-afterEach(() => {
-    return cleanup()
+describe('copyCaptainDataForBackup', () => {
+    test('copies data contents without nesting and excludes shared logs', async () => {
+        const root = await mkdtemp(join(tmpdir(), 'caprover-backup-copy-'))
+        const source = join(root, 'source')
+        const destination = join(root, 'destination')
+
+        try {
+            await ensureDir(join(source, 'shared-logs'))
+            await writeFile(join(source, 'config-captain.json'), '{}')
+            await writeFile(join(source, 'shared-logs', 'access.log'), 'log')
+            await symlink(
+                '/missing-certificate.pem',
+                join(source, 'broken-certificate-link')
+            )
+
+            await copyCaptainDataForBackup(source, destination)
+
+            expect(
+                await readFile(join(destination, 'config-captain.json'), 'utf8')
+            ).toBe('{}')
+            expect(
+                await pathExists(
+                    join(destination, 'source', 'config-captain.json')
+                )
+            ).toBe(false)
+            expect(await pathExists(join(destination, 'shared-logs'))).toBe(
+                false
+            )
+            expect(
+                (
+                    await lstat(join(destination, 'broken-certificate-link'))
+                ).isSymbolicLink()
+            ).toBe(true)
+            expect(
+                await readlink(join(destination, 'broken-certificate-link'))
+            ).toBe('/missing-certificate.pem')
+        } finally {
+            await rm(root, { recursive: true, force: true })
+        }
+    })
+
+    test('rejects when the source copy fails', async () => {
+        const root = await mkdtemp(join(tmpdir(), 'caprover-backup-copy-'))
+
+        try {
+            await expect(
+                copyCaptainDataForBackup(
+                    join(root, 'missing-source'),
+                    join(root, 'destination')
+                )
+            ).rejects.toThrow()
+        } finally {
+            await rm(root, { recursive: true, force: true })
+        }
+    })
 })
 
-test('No backup file', () => {
-    const bk = new BackupManager()
-    return Promise.resolve()
-        .then(function () {
-            return bk.checkAndPrepareRestoration()
-        })
-        .then(function (data) {
-            expect(data).toBeFalsy()
-        })
-})
+if (process.env.CI) {
+    describe('backup tests [CI only]', backupTests)
+} else {
+    describe.skip('backup tests [CI only]', backupTests)
+}
 
-test('Test backup file', () => {
-    const bk = new BackupManager()
-    return Promise.resolve()
-        .then(function () {
-            return copy(`${__dirname}/backup.tar`, BACKUP_FILE_PATH_ABSOLUTE)
-        })
-        .then(function () {
-            return bk.checkAndPrepareRestoration()
-        })
-        .then(function () {
-            return readJson(
+function backupTests() {
+    test('No backup file', () => {
+        const bk = new BackupManager()
+        return Promise.resolve()
+            .then(function () {
+                return bk.checkAndPrepareRestoration()
+            })
+            .then(function (data) {
+                expect(data).toBeFalsy()
+            })
+    })
+
+    test('Restores malformed backup with nested data/data layout', async () => {
+        const sourceDirectory = '/tmp/caprover-malformed-backup-test'
+        const malformedDataDirectory = `${sourceDirectory}/data/data`
+
+        await remove(sourceDirectory)
+
+        try {
+            await outputJson(`${sourceDirectory}/meta/backup.json`, {
+                salt: 'test-salt',
+                nodes: [
+                    {
+                        nodeId: '123456789',
+                        type: 'manager',
+                        isLeader: true,
+                        hostname: 'test',
+                        architecture: 'x86_64',
+                        operatingSystem: 'linux',
+                        nanoCpu: 8000000000,
+                        memoryBytes: 8241434624,
+                        dockerEngineVersion: '18.09.2',
+                        ip: '123.123.123.123',
+                        state: 'ready',
+                        status: 'active',
+                    },
+                ],
+            })
+            await outputJson(`${malformedDataDirectory}/config-captain.json`, {
+                appDefinitions: {
+                    pers1: {
+                        nodeId: '123456789',
+                    },
+                },
+            })
+            await ensureDir(`${malformedDataDirectory}/shared-logs`)
+            await outputJson(
+                `${malformedDataDirectory}/shared-logs/should-not-restore.json`,
+                { ignored: true }
+            )
+
+            await tar.c(
+                {
+                    file: BACKUP_FILE_PATH_ABSOLUTE,
+                    cwd: sourceDirectory,
+                },
+                ['./']
+            )
+
+            const bk = new BackupManager()
+            await bk.checkAndPrepareRestoration()
+
+            expect(
+                await pathExists(
+                    `${CaptainConstants.restoreDirectoryPath}/data/config-captain.json`
+                )
+            ).toBe(true)
+            expect(
+                await pathExists(
+                    `${CaptainConstants.restoreDirectoryPath}/data/data/config-captain.json`
+                )
+            ).toBe(false)
+            expect(
+                await pathExists(
+                    `${CaptainConstants.restoreDirectoryPath}/data/shared-logs`
+                )
+            ).toBe(false)
+
+            const ret = (await readJson(
                 CaptainConstants.restoreDirectoryPath +
                     '/restore-instructions.json'
+            )) as RestoringInfo
+
+            expect(ret.nodesMapping).toEqual([
+                {
+                    newIp: 'CURRENT_NODE_DONT_CHANGE',
+                    oldIp: '123.123.123.123',
+                    privateKeyPath: '',
+                    user: '',
+                },
+            ])
+            expect(ret.oldNodesForReference[0].appsLockOnThisNode).toEqual([
+                'pers1',
+            ])
+        } finally {
+            await remove(sourceDirectory)
+        }
+    })
+
+    test('Rejects malformed nested backup without config-captain.json', async () => {
+        const sourceDirectory =
+            '/tmp/caprover-malformed-backup-missing-config-test'
+        const malformedDataDirectory = `${sourceDirectory}/data/data`
+
+        await remove(sourceDirectory)
+
+        try {
+            await outputJson(`${sourceDirectory}/meta/backup.json`, {
+                salt: 'test-salt',
+                nodes: [],
+            })
+            await ensureDir(malformedDataDirectory)
+
+            await tar.c(
+                {
+                    file: BACKUP_FILE_PATH_ABSOLUTE,
+                    cwd: sourceDirectory,
+                },
+                ['./']
             )
-        })
-        .then(function (ret: RestoringInfo) {
-            const expectedValue = {
-                nodesMapping: [
-                    {
-                        newIp: 'CURRENT_NODE_DONT_CHANGE',
-                        oldIp: '123.123.123.123',
-                        privateKeyPath: '',
-                        user: '',
-                    },
-                ],
-                oldNodesForReference: [
-                    {
-                        nodeData: {
-                            nodeId: '123456789',
-                            type: 'manager',
-                            isLeader: true,
-                            hostname: 'test',
-                            architecture: 'x86_64',
-                            operatingSystem: 'linux',
-                            nanoCpu: 8000000000,
-                            memoryBytes: 8241434624,
-                            dockerEngineVersion: '18.09.2',
-                            ip: '123.123.123.123',
-                            state: 'ready',
-                            status: 'active',
+
+            const bk = new BackupManager()
+            await expect(bk.checkAndPrepareRestoration()).rejects.toThrow()
+
+            expect(
+                await pathExists(
+                    CaptainConstants.restoreDirectoryPath +
+                        '/restore-instructions.json'
+                )
+            ).toBe(false)
+        } finally {
+            await remove(sourceDirectory)
+        }
+    })
+
+    test('Test backup file', () => {
+        const bk = new BackupManager()
+        return Promise.resolve()
+            .then(function () {
+                return copy(
+                    `${__dirname}/backup.tar`,
+                    BACKUP_FILE_PATH_ABSOLUTE
+                )
+            })
+            .then(function () {
+                return bk.checkAndPrepareRestoration()
+            })
+            .then(function () {
+                return readJson(
+                    CaptainConstants.restoreDirectoryPath +
+                        '/restore-instructions.json'
+                )
+            })
+            .then(function (ret: RestoringInfo) {
+                const expectedValue = {
+                    nodesMapping: [
+                        {
+                            newIp: 'CURRENT_NODE_DONT_CHANGE',
+                            oldIp: '123.123.123.123',
+                            privateKeyPath: '',
+                            user: '',
                         },
-                        appsLockOnThisNode: ['pers1'],
-                    },
-                ],
-            }
-            expect(isDeepStrictEqual(ret, expectedValue)).toBe(true)
-            ret.nodesMapping[0].oldIp += ' '
-            expect(isDeepStrictEqual(ret, expectedValue)).toBe(false)
-        })
-})
+                    ],
+                    oldNodesForReference: [
+                        {
+                            nodeData: {
+                                nodeId: '123456789',
+                                type: 'manager',
+                                isLeader: true,
+                                hostname: 'test',
+                                architecture: 'x86_64',
+                                operatingSystem: 'linux',
+                                nanoCpu: 8000000000,
+                                memoryBytes: 8241434624,
+                                dockerEngineVersion: '18.09.2',
+                                ip: '123.123.123.123',
+                                state: 'ready',
+                                status: 'active',
+                            },
+                            appsLockOnThisNode: ['pers1'],
+                        },
+                    ],
+                }
+                expect(isDeepStrictEqual(ret, expectedValue)).toBe(true)
+                ret.nodesMapping[0].oldIp += ' '
+                expect(isDeepStrictEqual(ret, expectedValue)).toBe(false)
+            })
+    })
+}

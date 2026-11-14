@@ -40,7 +40,11 @@ import tar = require('tar')
 import path = require('path')
 import ApiStatusCodes from '../api/ApiStatusCodes'
 import DockerApi from '../docker/DockerApi'
+import { IAppEnvVar } from '../models/AppDefinition'
 import { IBuiltImage } from '../models/IBuiltImage'
+import { IHashMapGeneric } from '../models/ICacheGeneric'
+import { ICaptainDefinition } from '../models/ICaptainDefinition'
+import { IImageSource } from '../models/IImageSource'
 import { AnyError } from '../models/OtherTypes'
 import CaptainConstants from '../utils/CaptainConstants'
 import GitHelper from '../utils/GitHelper'
@@ -123,6 +127,18 @@ export default class ImageMaker {
             })
             .then(function (gitHashFromImageSource) {
                 gitHash = gitHashFromImageSource
+
+                const includesGitCommitEnvVar = envVars.find(
+                    (envVar) => envVar.key === CaptainConstants.gitShaEnvVarKey
+                )
+
+                if (gitHash && !includesGitCommitEnvVar) {
+                    envVars.push({
+                        key: CaptainConstants.gitShaEnvVarKey,
+                        value: gitHash,
+                    })
+                }
+
                 // some users convert the directory into TAR instead of converting the content into TAR.
                 // we go one level deep and try to find the right directory.
                 // Also, they may have no captain-definition file, in that case, fall back to Dockerfile if exists.
@@ -397,10 +413,10 @@ export default class ImageMaker {
                 const hasDockerfileLines =
                     data.dockerfileLines && data.dockerfileLines.length > 0
 
-                let numberOfProperties =
-                    (!!data.templateId ? 1 : 0) +
-                    (!!data.imageName ? 1 : 0) +
-                    (!!data.dockerfilePath ? 1 : 0) +
+                const numberOfProperties =
+                    (data.templateId ? 1 : 0) +
+                    (data.imageName ? 1 : 0) +
+                    (data.dockerfilePath ? 1 : 0) +
                     (hasDockerfileLines ? 1 : 0)
 
                 if (numberOfProperties !== 1) {
@@ -420,7 +436,7 @@ export default class ImageMaker {
     ) {
         return Promise.resolve() //
             .then(function () {
-                let data = captainDefinition
+                const data = captainDefinition
                 if (data.templateId) {
                     return TemplateHelper.get().getDockerfileContentFromTemplateTag(
                         data.templateId
@@ -501,10 +517,11 @@ export default class ImageMaker {
                         .then(function (dockerfileExists) {
                             if (!dockerfileExists) return false
 
-                            const captainDefinitionDefault: ICaptainDefinition = {
-                                schemaVersion: 2,
-                                dockerfilePath: `./${DOCKER_FILE}`,
-                            }
+                            const captainDefinitionDefault: ICaptainDefinition =
+                                {
+                                    schemaVersion: 2,
+                                    dockerfilePath: `./${DOCKER_FILE}`,
+                                }
 
                             return fs
                                 .outputFile(

@@ -6,9 +6,34 @@ import Utils from '../../utils/Utils'
 
 const router = express.Router()
 
+export function handleDownloadCompletion(
+    error: Error | undefined,
+    fileFullPath: string,
+    res: Pick<express.Response, 'headersSent' | 'sendStatus'>,
+    next: express.NextFunction
+): void {
+    Utils.deleteFileQuietly(fileFullPath)
+
+    if (!error) return
+
+    const downloadError = error as NodeJS.ErrnoException & {
+        status?: number
+    }
+
+    if (
+        !res.headersSent &&
+        (downloadError.status === 404 || downloadError.code === 'ENOENT')
+    ) {
+        res.sendStatus(404)
+        return
+    }
+
+    next(error)
+}
+
 router.get('/', function (req, res, next) {
-    let downloadToken = req.query.downloadToken as string
-    let namespace = req.query.namespace as string
+    const downloadToken = req.query.downloadToken as string
+    const namespace = req.query.namespace as string
 
     Promise.resolve() //
         .then(function () {
@@ -18,8 +43,8 @@ router.get('/', function (req, res, next) {
         })
         .then(function (obj) {
             const fileFullPath = `${CaptainConstants.captainDownloadsDirectory}/${namespace}/${obj.downloadFileName}`
-            res.download(fileFullPath, function () {
-                Utils.deleteFileQuietly(fileFullPath)
+            res.download(fileFullPath, function (error) {
+                handleDownloadCompletion(error, fileFullPath, res, next)
             })
         })
         .catch(ApiStatusCodes.createCatcher(res))

@@ -3,6 +3,7 @@
  */
 
 import ApiStatusCodes from '../api/ApiStatusCodes'
+import { IHashMapGeneric } from '../models/ICacheGeneric'
 import CaptainConstants from '../utils/CaptainConstants'
 import DataStore from './DataStore'
 
@@ -11,7 +12,10 @@ const dataStoreCache: IHashMapGeneric<DataStore> = {}
 export default {
     getDataStore: function (namespace: string) {
         if (!namespace) {
-            throw new Error('NameSpace is empty')
+            throw ApiStatusCodes.createError(
+                ApiStatusCodes.STATUS_ERROR_NOT_AUTHORIZED,
+                'Empty namespace'
+            )
         }
 
         if (namespace !== CaptainConstants.rootNameSpace) {

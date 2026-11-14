@@ -9,6 +9,7 @@ const router = express.Router()
 
 const urlencodedParser = bodyParser.urlencoded({
     extended: true,
+    limit: '2mb',
 })
 
 function getPushedBranches(req: express.Request) {
@@ -16,27 +17,27 @@ function getPushedBranches(req: express.Request) {
 
     // find which branch is pushed
     // Add it in pushedBranches
-    let isGithub = req.header('X-GitHub-Event') === 'push'
-    let isBitbucket =
+    const isGithub = req.header('X-GitHub-Event') === 'push'
+    const isBitbucket =
         req.header('X-Event-Key') === 'repo:push' &&
         req.header('X-Request-UUID') &&
         req.header('X-Hook-UUID')
-    let isGitlab = req.header('X-Gitlab-Event') === 'Push Hook'
+    const isGitlab = req.header('X-Gitlab-Event') === 'Push Hook'
 
     if (isGithub) {
-        let refPayloadByFormEncoded = req.body.payload
+        const refPayloadByFormEncoded = req.body.payload
         let bodyJson = req.body
         if (refPayloadByFormEncoded) {
             bodyJson = JSON.parse(refPayloadByFormEncoded)
         }
-        let ref = bodyJson.ref // "refs/heads/somebranch"
+        const ref = bodyJson.ref // "refs/heads/somebranch"
         pushedBranches.push(ref.substring(11, ref.length))
     } else if (isBitbucket) {
         for (let i = 0; i < req.body.push.changes.length; i++) {
             pushedBranches.push(req.body.push.changes[i].new.name)
         }
     } else if (isGitlab) {
-        let ref = req.body.ref // "refs/heads/somebranch"
+        const ref = req.body.ref // "refs/heads/somebranch"
         pushedBranches.push(ref.substring(11, ref.length))
     }
     return pushedBranches
@@ -45,9 +46,8 @@ function getPushedBranches(req: express.Request) {
 router.post('/triggerbuild', urlencodedParser, function (req, res, next) {
     return Promise.resolve()
         .then(function () {
-            const extracted = InjectionExtractor.extractAppAndUserForWebhook(
-                res
-            )
+            const extracted =
+                InjectionExtractor.extractAppAndUserForWebhook(res)
             const { serviceManager, namespace } = extracted.user
             const { appName, app } = extracted
 

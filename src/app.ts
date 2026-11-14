@@ -6,12 +6,15 @@ import cookieParser = require('cookie-parser')
 import bodyParser = require('body-parser')
 import httpProxyImport = require('http-proxy')
 
+import * as http from 'http'
 import ApiStatusCodes from './api/ApiStatusCodes'
 import BaseApi from './api/BaseApi'
+import DockerApi from './docker/DockerApi'
 import InjectionExtractor from './injection/InjectionExtractor'
 import * as Injector from './injection/Injector'
 import DownloadRouter from './routes/download/DownloadRouter'
 import LoginRouter from './routes/login/LoginRouter'
+import ThemePublicRouter from './routes/public/ThemePublicRouter'
 import UserRouter from './routes/user/UserRouter'
 import CaptainManager from './user/system/CaptainManager'
 import CaptainConstants from './utils/CaptainConstants'
@@ -22,7 +25,7 @@ import Utils from './utils/Utils'
 
 const httpProxy = httpProxyImport.createProxyServer({})
 
-let app = express()
+const app = express()
 
 app.set('views', path.join(__dirname, '../views'))
 app.set('view engine', 'ejs')
@@ -40,16 +43,21 @@ app.use(
         },
     })
 )
-app.use(bodyParser.json())
+app.use(
+    bodyParser.json({
+        limit: '2mb',
+    })
+)
 app.use(
     bodyParser.urlencoded({
         extended: false,
+        limit: '2mb',
     })
 )
 app.use(cookieParser())
 
 if (CaptainConstants.isDebug) {
-    app.use('*', function (req, res, next) {
+    app.use('/', function (req, res, next) {
         res.setHeader('Access-Control-Allow-Origin', '*')
         res.setHeader('Access-Control-Allow-Credentials', 'true')
         res.setHeader(
@@ -77,11 +85,11 @@ app.use(Injector.injectGlobal())
 
 app.use(function (req, res, next) {
     if (InjectionExtractor.extractGlobalsFromInjected(res).forceSsl) {
-        let isRequestSsl =
+        const isRequestSsl =
             req.secure || req.get('X-Forwarded-Proto') === 'https'
 
         if (!isRequestSsl) {
-            let newUrl = `https://${req.get('host')}${req.originalUrl}`
+            const newUrl = `https://${req.hostname}:${CaptainConstants.configs.nginxPortNumber443}${req.originalUrl}`
             res.redirect(302, newUrl)
             return
         }
@@ -105,12 +113,16 @@ app.use(CaptainConstants.netDataRelativePath, function (req, res, next) {
         req.originalUrl.indexOf(CaptainConstants.netDataRelativePath + '/') !==
         0
     ) {
-        let isRequestSsl =
+        const isRequestSsl =
             req.secure || req.get('X-Forwarded-Proto') === 'https'
 
-        let newUrl =
+        const newUrl =
             (isRequestSsl ? 'https://' : 'http://') +
-            req.get('host') +
+            req.hostname +
+            ':' +
+            (isRequestSsl
+                ? CaptainConstants.configs.nginxPortNumber443
+                : CaptainConstants.configs.nginxPortNumber80) +
             CaptainConstants.netDataRelativePath +
             '/'
         res.redirect(302, newUrl)
@@ -134,7 +146,7 @@ app.use(CaptainConstants.netDataRelativePath, function (req, res, next) {
     }
 })
 
-httpProxy.on('error', function (err, req, resOriginal) {
+httpProxy.on('error', function (err, req, resOriginal: http.ServerResponse) {
     if (err) {
         Logger.e(err)
     }
@@ -173,7 +185,7 @@ app.use(CaptainConstants.netDataRelativePath, function (req, res, next) {
 
 //  *********************  Beginning of API End Points  *******************************************
 
-let API_PREFIX = '/api/'
+const API_PREFIX = '/api/'
 
 app.use(API_PREFIX + ':apiVersionFromRequest/', function (req, res, next) {
     if (req.params.apiVersionFromRequest !== CaptainConstants.apiVersion) {
@@ -187,9 +199,18 @@ app.use(API_PREFIX + ':apiVersionFromRequest/', function (req, res, next) {
     }
 
     if (!InjectionExtractor.extractGlobalsFromInjected(res).initialized) {
-        let response = new BaseApi(
+        const response = new BaseApi(
             ApiStatusCodes.STATUS_ERROR_CAPTAIN_NOT_INITIALIZED,
             'Captain is not ready yet...'
+        )
+        res.send(response)
+        return
+    }
+
+    if (DockerApi.get().dockerNeedsUpdate) {
+        const response = new BaseApi(
+            ApiStatusCodes.STATUS_ERROR_GENERIC,
+            'Docker version is too old. Please update Docker to use CapRover.'
         )
         res.send(response)
         return
@@ -204,6 +225,7 @@ app.use(
     API_PREFIX + CaptainConstants.apiVersion + '/downloads/',
     DownloadRouter
 )
+app.use(API_PREFIX + CaptainConstants.apiVersion + '/theme/', ThemePublicRouter)
 
 // secured end points
 app.use(API_PREFIX + CaptainConstants.apiVersion + '/user/', UserRouter)

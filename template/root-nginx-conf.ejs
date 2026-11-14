@@ -22,7 +22,7 @@
             allow 172.16.0.0/12;
             allow 10.0.0.0/8;
             allow 192.168.0.0/16;
-            
+
             deny all;
         }
 
@@ -39,8 +39,40 @@
 # Captain dashboard at captain.captainroot.domain.com
     server {
 
-        listen       80;
-        client_max_body_size 300m;
+	listen       80;
+	client_max_body_size 300m;
+
+	# Keep idle API connections alive during a graceful reload long enough for
+	# pooled clients to retire them. Node's default agent keeps idle sockets for
+	# 5 seconds, so leave a safety margin beyond that client-side timeout.
+	keepalive_min_timeout 10s;
+
+	gzip on;
+	gzip_disable "MSIE [1-6]\.";
+	gzip_vary on;
+	gzip_proxied any;
+	gzip_comp_level 6;
+	gzip_min_length 16000;
+	gzip_buffers 16 8k;
+	gzip_types
+		text/css
+		text/plain
+		text/javascript
+		application/javascript
+		application/json
+		application/x-javascript
+		application/xml
+		application/xml+rss
+		application/xhtml+xml
+		application/x-font-ttf
+		application/x-font-opentype
+		application/vnd.ms-fontobject
+		image/svg+xml
+		image/x-icon
+		application/rss+xml
+		application/atom_xml;
+
+
 
     <%
         if (captain.hasRootSsl) {
@@ -59,7 +91,7 @@
         # https://docs.docker.com/engine/userguide/networking/configure-dns/
         # https://github.com/moby/moby/issues/20026
         resolver 127.0.0.11 valid=10s;
-        set $upstream http://<%-captain.serviceName%>:<%-captain.serviceExposedPort%>;
+        set $upstream http://<%-captain.serviceName%>:<%-captain.serviceContainerPort3000%>;
 
         # IMPORTANT!! Except proxy_read_timeout, this block should be same as location /api/v2/user/apps/appData
         location / {
@@ -85,11 +117,12 @@
         location /.well-known/acme-challenge/ {
             root <%-captain.staticWebRoot%>;
         }
-        
+
         # Used by CapRover for health check
         location /.well-known/captain-identifier {
             root <%-captain.staticWebRoot%>;
         }
+
     }
 
 

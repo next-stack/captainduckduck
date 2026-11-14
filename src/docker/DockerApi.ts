@@ -1,51 +1,46 @@
 import Base64Provider = require('js-base64')
 import Docker = require('dockerode')
 import { v4 as uuid } from 'uuid'
+import {
+    IAppDef,
+    IAppEnvVar,
+    IAppPort,
+    IAppVolume,
+    VolumesTypes,
+} from '../models/AppDefinition'
+import { DockerAuthObj, DockerRegistryConfig } from '../models/DockerAuthObj'
+import { DockerSecret } from '../models/DockerSecret'
 import DockerService from '../models/DockerService'
+import {
+    DockerBuildOutputDecoder,
+    DockerJsonMessage,
+    DockerJsonStreamParser,
+} from './DockerBuildOutput'
+import {
+    DockerRuntimeNode,
+    DockerRuntimeTask,
+    getServiceRuntime,
+    ServiceRuntime,
+    unavailableServiceRuntime,
+} from './ServiceRuntime'
+import { IHashMapGeneric } from '../models/ICacheGeneric'
 import {
     IDockerApiPort,
     IDockerContainerResource,
-    VolumesTypes,
+    PreDeployFunction,
 } from '../models/OtherTypes'
+import { ServerDockerInfo } from '../models/ServerDockerInfo'
 import BuildLog from '../user/BuildLog'
 import CaptainConstants from '../utils/CaptainConstants'
 import EnvVars from '../utils/EnvVars'
 import Logger from '../utils/Logger'
 import Utils from '../utils/Utils'
-const dockerodeUtils = require('dockerode/lib/util')
+import Dockerode = require('dockerode')
+// @ts-expect-error "TODO"
+import dockerodeUtils = require('dockerode/lib/util')
 
 const Base64 = Base64Provider.Base64
-
-function safeParseChunk(
-    chunk: string
-): {
-    stream?: string
-    error?: any
-    errorDetail?: any
-}[] {
-    chunk = `${chunk}`.trim()
-    try {
-        // See https://github.com/caprover/caprover/issues/570
-        // This appears to be bug either in Docker or dockerone:
-        // Sometimes chunk appears as two JSON objects, like
-        // ```
-        // {"stream":"something......"}
-        // {"stream":"another line of things"}
-        // ```
-        const chunks = chunk.split('\n')
-        const returnVal = [] as any[]
-        chunks.forEach((chk) => {
-            returnVal.push(JSON.parse(chk))
-        })
-        return returnVal
-    } catch (ignore) {
-        return [
-            {
-                stream: `Cannot parse ${chunk}`,
-            },
-        ]
-    }
-}
+const CAPROVER_MANAGED_SERVICE_LABEL = 'com.caprover.managed'
 
 export abstract class IDockerUpdateOrders {
     public static readonly AUTO = 'auto'
@@ -54,8 +49,75 @@ export abstract class IDockerUpdateOrders {
 }
 export type IDockerUpdateOrder = 'auto' | 'stopFirst' | 'startFirst'
 
+export function getLegacyServiceDnsAlias(
+    serviceName: string,
+    namespace: string | undefined,
+    isLegacyAppName: boolean
+) {
+    if (!namespace || isLegacyAppName) {
+        return undefined
+    }
+
+    return `srv-${namespace}--${serviceName}`
+}
+
+export interface IServiceNetworkAttachment {
+    Target: string
+    Aliases?: string[]
+}
+
+export function getServiceNetworkAttachments(
+    networks: string[],
+    legacyDnsAlias: string | undefined
+) {
+    return networks.map((network) => {
+        const attachment: IServiceNetworkAttachment = {
+            Target: network,
+        }
+
+        if (legacyDnsAlias) {
+            attachment.Aliases = [legacyDnsAlias]
+        }
+
+        return attachment
+    })
+}
+
+export interface CreateContainerParams {
+    containerName?: string
+    imageName: string
+
+    /** Override command to run the container with */
+    command?: string[]
+
+    /** an array, hostPath & containerPath, mode */
+    volumes: IAppVolume[]
+    network: string
+
+    /**
+     *
+     * [
+     *    {
+     *        key: 'somekey'
+     *        value: 'some value'
+     *    }
+     * ]
+     */
+    arrayOfEnvKeyAndValue: IAppEnvVar[]
+    addedCapabilities?: string[]
+    addedSecOptions?: string[]
+    authObj?: DockerAuthObj
+    /** If true, have the container always restart,
+     * If false act as a one off job runner that cleans up after itself */
+    sticky: boolean
+    /** If set true, waits for the container to exit before returning */
+    wait?: boolean
+}
+
 class DockerApi {
     private dockerode: Docker
+
+    public dockerNeedsUpdate = false
 
     constructor(connectionParams: Docker.DockerOptions) {
         this.dockerode = new Docker(connectionParams)
@@ -63,6 +125,16 @@ class DockerApi {
 
     static get() {
         return dockerApiInstance
+    }
+
+    ensureSwarmExists() {
+        const self = this
+
+        return self.dockerode
+            .swarmInspect() //
+            .then(function (data) {
+                return data.ID
+            })
     }
 
     initSwarm(ip: string, portNumber?: number) {
@@ -159,7 +231,89 @@ class DockerApi {
                 return self.dockerode.listServices()
             })
             .then(function (services) {
-                return ((services || []) as unknown) as DockerService[]
+                return (services || []) as unknown as DockerService[]
+            })
+    }
+
+    getServiceRuntimes(serviceNames: string[]): Promise<ServiceRuntime[]> {
+        const self = this
+        if (!serviceNames.length) return Promise.resolve([])
+
+        return Promise.resolve()
+            .then(function () {
+                return self.dockerode.listServices({
+                    filters: { name: serviceNames },
+                    status: true,
+                })
+            })
+            .then(function (services) {
+                // Docker's name filter can match prefixes. Match exact names
+                // before collecting tasks so another app's state cannot leak.
+                const ownedServices = services.filter(function (service) {
+                    return serviceNames.includes(service.Spec?.Name || '')
+                })
+                if (!ownedServices.length) {
+                    return {
+                        ownedServices,
+                        tasks: [] as DockerRuntimeTask[],
+                        nodes: [] as DockerRuntimeNode[],
+                    }
+                }
+
+                const tasksPromise: Promise<DockerRuntimeTask[]> =
+                    self.dockerode.listTasks({
+                        filters: {
+                            service: ownedServices.map(function (service) {
+                                return service.ID
+                            }),
+                        },
+                    })
+                const nodesPromise: Promise<DockerRuntimeNode[]> =
+                    self.dockerode.listNodes().catch(function (error) {
+                        Logger.e(
+                            error,
+                            'Unable to retrieve Docker nodes for app runtime'
+                        )
+                        return []
+                    })
+
+                return Promise.all([tasksPromise, nodesPromise]).then(
+                    function ([tasks, nodes]) {
+                        return { ownedServices, tasks, nodes }
+                    }
+                )
+            })
+            .then(function ({ ownedServices, tasks, nodes }) {
+                return serviceNames.map(function (serviceName) {
+                    const service = ownedServices.find(function (service) {
+                        return service.Spec?.Name === serviceName
+                    })
+                    if (!service) {
+                        return unavailableServiceRuntime('Service not found')
+                    }
+                    try {
+                        return getServiceRuntime(
+                            service,
+                            tasks.filter(function (task) {
+                                return task.ServiceID === service.ID
+                            }),
+                            nodes
+                        )
+                    } catch (error) {
+                        Logger.e(error, 'Unable to retrieve app runtime')
+                        return unavailableServiceRuntime(
+                            'Unable to retrieve app runtime'
+                        )
+                    }
+                })
+            })
+            .catch(function (error) {
+                Logger.e(error, 'Unable to retrieve app runtime')
+                return serviceNames.map(function () {
+                    return unavailableServiceRuntime(
+                        'Unable to retrieve app runtime'
+                    )
+                })
             })
     }
 
@@ -264,10 +418,11 @@ class DockerApi {
                     )
                 }
 
-                const optionsForBuild = {
+                const optionsForBuild: Dockerode.ImageBuildOptions = {
                     t: imageName,
                     buildargs: buildargs,
-                } as any
+                    version: CaptainConstants.configs.defaultDockerBuildVersion,
+                }
 
                 if (Object.keys(registryConfig).length > 0) {
                     // https://github.com/apocas/dockerode/blob/ed6ef39e0fc81963fedf208c7e0854d8a44cb9a8/lib/docker.js#L271-L274
@@ -278,19 +433,17 @@ class DockerApi {
 
                 return self.dockerode.buildImage(
                     tarballFilePath,
-                    optionsForBuild as {}
+                    optionsForBuild
                 )
             })
             .then(function (stream) {
                 return new Promise<void>(function (resolve, reject) {
                     let errorMessage = ''
+                    const streamParser = new DockerJsonStreamParser()
+                    const outputDecoder = new DockerBuildOutputDecoder()
 
-                    stream.setEncoding('utf8')
-
-                    // THIS BLOCK HAS TO BE HERE. "end" EVENT WON'T GET CALLED OTHERWISE.
-                    stream.on('data', function (chunkRaw) {
-                        Logger.dev(`stream data ${chunkRaw}`)
-                        safeParseChunk(chunkRaw).forEach((chunk) => {
+                    function processMessage(message: DockerJsonMessage) {
+                        outputDecoder.decode(message).forEach((chunk) => {
                             const chuckStream = chunk.stream
                             if (chuckStream) {
                                 // Logger.dev('stream data ' + chuckStream);
@@ -311,6 +464,14 @@ class DockerApi {
                                 errorMessage += chunk.error
                             }
                         })
+                    }
+
+                    stream.setEncoding('utf8')
+
+                    // THIS BLOCK HAS TO BE HERE. "end" EVENT WON'T GET CALLED OTHERWISE.
+                    stream.on('data', function (chunkRaw) {
+                        Logger.dev(`stream data ${chunkRaw}`)
+                        streamParser.push(chunkRaw).forEach(processMessage)
                     })
 
                     // stream.pipe(process.stdout, {end: true});
@@ -318,6 +479,7 @@ class DockerApi {
                     // https://nodejs.org/api/stream.html#stream_event_end
 
                     stream.on('end', function () {
+                        streamParser.flush().forEach(processMessage)
                         if (errorMessage) {
                             reject(errorMessage)
                             return
@@ -362,8 +524,27 @@ class DockerApi {
                 return new Promise<void>(function (resolve, reject) {
                     let errorMessage = ''
                     const logsBeforeError: string[] = []
+                    const streamParser = new DockerJsonStreamParser()
                     for (let i = 0; i < 20; i++) {
                         logsBeforeError.push('')
+                    }
+
+                    function processMessage(chunk: DockerJsonMessage) {
+                        const chuckStream = chunk.stream
+                        if (chuckStream) {
+                            // Logger.dev('stream data ' + chuckStream);
+                            logsBeforeError.shift()
+                            logsBeforeError.push(chuckStream)
+                        }
+
+                        if (chunk.error) {
+                            Logger.e(chunk.error)
+                            Logger.e(JSON.stringify(chunk.errorDetail))
+                            errorMessage += '\n [truncated] \n'
+                            errorMessage += logsBeforeError.join('')
+                            errorMessage += '\n'
+                            errorMessage += chunk.error
+                        }
                     }
 
                     stream.setEncoding('utf8')
@@ -371,23 +552,7 @@ class DockerApi {
                     // THIS BLOCK HAS TO BE HERE. "end" EVENT WON'T GET CALLED OTHERWISE.
                     stream.on('data', function (chunkRaw) {
                         Logger.dev(`stream data ${chunkRaw}`)
-                        safeParseChunk(chunkRaw).forEach((chunk) => {
-                            const chuckStream = chunk.stream
-                            if (chuckStream) {
-                                // Logger.dev('stream data ' + chuckStream);
-                                logsBeforeError.shift()
-                                logsBeforeError.push(chuckStream)
-                            }
-
-                            if (chunk.error) {
-                                Logger.e(chunk.error)
-                                Logger.e(JSON.stringify(chunk.errorDetail))
-                                errorMessage += '\n [truncated] \n'
-                                errorMessage += logsBeforeError.join('')
-                                errorMessage += '\n'
-                                errorMessage += chunk.error
-                            }
-                        })
+                        streamParser.push(chunkRaw).forEach(processMessage)
                     })
 
                     // stream.pipe(process.stdout, {end: true});
@@ -395,6 +560,7 @@ class DockerApi {
                     // https://nodejs.org/api/stream.html#stream_event_end
 
                     stream.on('end', function () {
+                        streamParser.flush().forEach(processMessage)
                         if (errorMessage) {
                             reject(errorMessage)
                             return
@@ -480,7 +646,7 @@ class DockerApi {
     }
 
     /**
-     * Creates a volume thar restarts unless stopped
+     * Creates a container that restarts unless stopped
      * @param containerName
      * @param imageName
      * @param volumes     an array, hostPath & containerPath, mode
@@ -505,9 +671,40 @@ class DockerApi {
         addedSecOptions: string[],
         authObj: DockerAuthObj | undefined
     ) {
+        return this.createContainer({
+            containerName,
+            imageName,
+            volumes,
+            network,
+            arrayOfEnvKeyAndValue,
+            addedCapabilities,
+            addedSecOptions,
+            authObj,
+            sticky: true,
+        })
+    }
+
+    /**
+     * Creates a docker container
+     */
+    createContainer({
+        containerName,
+        imageName,
+        command,
+        volumes,
+        network,
+        arrayOfEnvKeyAndValue,
+        addedCapabilities,
+        addedSecOptions,
+        authObj,
+        sticky,
+        wait = false,
+    }: CreateContainerParams) {
         const self = this
 
-        Logger.d(`Creating Sticky Container: ${imageName}`)
+        Logger.d(
+            `Creating ${sticky ? 'Sticky' : 'Ephemeral'} Container: ${imageName}`
+        )
 
         const volumesMapped: string[] = []
         volumes = volumes || []
@@ -525,6 +722,8 @@ class DockerApi {
             envs.push(`${e.key}=${e.value}`)
         }
 
+        let container: Docker.Container | undefined = undefined
+
         return Promise.resolve()
             .then(function () {
                 return self.pullImage(imageName, authObj)
@@ -534,6 +733,7 @@ class DockerApi {
                     name: containerName,
                     Image: imageName,
                     Env: envs,
+                    Cmd: command,
                     HostConfig: {
                         Binds: volumesMapped,
                         CapAdd: addedCapabilities,
@@ -546,14 +746,26 @@ class DockerApi {
                                     CaptainConstants.configs.defaultMaxLogSize,
                             },
                         },
-                        RestartPolicy: {
-                            Name: 'always',
-                        },
+                        ...(sticky
+                            ? {
+                                  RestartPolicy: {
+                                      Name: 'always',
+                                  },
+                              }
+                            : {}),
+                        AutoRemove: !CaptainConstants.isDebug && !sticky,
                     },
                 })
             })
             .then(function (data) {
+                container = data
                 return data.start()
+            })
+            .then(function (startInfo) {
+                if (wait && container) {
+                    return container.wait()
+                }
+                return startInfo
             })
     }
 
@@ -606,32 +818,35 @@ class DockerApi {
             .then(function (stream) {
                 return new Promise<void>(function (resolve, reject) {
                     let errorMessage = ''
+                    const streamParser = new DockerJsonStreamParser()
+
+                    function processMessage(chunk: DockerJsonMessage) {
+                        const chuckStream = chunk.stream
+                        if (chuckStream) {
+                            // Logger.dev('stream data ' + chuckStream);
+                            buildLogs.log(chuckStream)
+                        }
+
+                        if (chunk.error) {
+                            Logger.e(chunk.error)
+                            const errorDetails = JSON.stringify(
+                                chunk.errorDetail
+                            )
+                            Logger.e(errorDetails)
+                            buildLogs.log(errorDetails)
+                            buildLogs.log(chunk.error)
+                            errorMessage += '\n'
+                            errorMessage += errorDetails
+                            errorMessage += chunk.error
+                        }
+                    }
 
                     stream.setEncoding('utf8')
 
                     // THIS BLOCK HAS TO BE HERE. "end" EVENT WON'T GET CALLED OTHERWISE.
                     stream.on('data', function (chunkRaw) {
                         Logger.dev(`stream data ${chunkRaw}`)
-                        safeParseChunk(chunkRaw).forEach((chunk) => {
-                            const chuckStream = chunk.stream
-                            if (chuckStream) {
-                                // Logger.dev('stream data ' + chuckStream);
-                                buildLogs.log(chuckStream)
-                            }
-
-                            if (chunk.error) {
-                                Logger.e(chunk.error)
-                                const errorDetails = JSON.stringify(
-                                    chunk.errorDetail
-                                )
-                                Logger.e(errorDetails)
-                                buildLogs.log(errorDetails)
-                                buildLogs.log(chunk.error)
-                                errorMessage += '\n'
-                                errorMessage += errorDetails
-                                errorMessage += chunk.error
-                            }
-                        })
+                        streamParser.push(chunkRaw).forEach(processMessage)
                     })
 
                     // stream.pipe(process.stdout, {end: true});
@@ -639,6 +854,7 @@ class DockerApi {
                     // https://nodejs.org/api/stream.html#stream_event_end
 
                     stream.on('end', function () {
+                        streamParser.flush().forEach(processMessage)
                         if (errorMessage) {
                             buildLogs.log('Push failed...')
                             reject(errorMessage)
@@ -732,6 +948,9 @@ class DockerApi {
 
         const dataToCreate: any = {
             name: serviceName,
+            Labels: {
+                [CAPROVER_MANAGED_SERVICE_LABEL]: 'true',
+            },
             TaskTemplate: {
                 ContainerSpec: {
                     Image: imageName,
@@ -1158,7 +1377,7 @@ class DockerApi {
             })
     }
 
-    ensureOverlayNetwork(networkName: string) {
+    ensureOverlayNetwork(networkName: string, networkOverride: any) {
         const self = this
 
         return self.dockerode
@@ -1170,12 +1389,17 @@ class DockerApi {
             })
             .catch(function (error) {
                 if (error && error.statusCode === 404) {
-                    return self.dockerode.createNetwork({
-                        Name: networkName,
-                        CheckDuplicate: true,
-                        Driver: 'overlay',
-                        Attachable: true,
-                    })
+                    return self.dockerode.createNetwork(
+                        Utils.mergeObjects(
+                            {
+                                Name: networkName,
+                                CheckDuplicate: true,
+                                Driver: 'overlay',
+                                Attachable: true,
+                            },
+                            networkOverride
+                        )
+                    )
                 }
 
                 return new Promise<any>(function (resolve, reject) {
@@ -1239,7 +1463,7 @@ class DockerApi {
         appObject: IAppDef | undefined,
         updateOrder: IDockerUpdateOrder | undefined,
         serviceUpdateOverride: any | undefined,
-        preDeployFunction: Function | undefined
+        preDeployFunction: PreDeployFunction | undefined
     ) {
         const self = this
         return self.dockerode
@@ -1275,7 +1499,8 @@ class DockerApi {
                         }
                     }
                     newConstraints.push(`node.id == ${nodeId}`)
-                    updatedData.TaskTemplate.Placement.Constraints = newConstraints
+                    updatedData.TaskTemplate.Placement.Constraints =
+                        newConstraints
                 }
 
                 if (arrayOfEnvKeyAndValue) {
@@ -1294,22 +1519,32 @@ class DockerApi {
                     for (let i = 0; i < ports.length; i++) {
                         const p = ports[i]
                         if (p.protocol) {
-                            updatedData.EndpointSpec.Ports.push({
+                            const port: IDockerApiPort = {
                                 Protocol: p.protocol,
                                 TargetPort: p.containerPort,
                                 PublishedPort: p.hostPort,
-                            })
+                            }
+                            if (p.publishMode) {
+                                port.PublishMode = p.publishMode
+                            }
+                            updatedData.EndpointSpec.Ports.push(port)
                         } else {
-                            updatedData.EndpointSpec.Ports.push({
+                            const tcpPort: IDockerApiPort = {
                                 Protocol: 'tcp',
                                 TargetPort: p.containerPort,
                                 PublishedPort: p.hostPort,
-                            })
-                            updatedData.EndpointSpec.Ports.push({
+                            }
+                            const udpPort: IDockerApiPort = {
                                 Protocol: 'udp',
                                 TargetPort: p.containerPort,
                                 PublishedPort: p.hostPort,
-                            })
+                            }
+                            if (p.publishMode) {
+                                tcpPort.PublishMode = p.publishMode
+                                udpPort.PublishMode = p.publishMode
+                            }
+                            updatedData.EndpointSpec.Ports.push(tcpPort)
+                            updatedData.EndpointSpec.Ports.push(udpPort)
                         }
                     }
                 }
@@ -1319,7 +1554,7 @@ class DockerApi {
                     for (let idx = 0; idx < volumes.length; idx++) {
                         const v = volumes[idx]
 
-                        if (!!v.hostPath) {
+                        if (v.hostPath) {
                             mts.push({
                                 Source: v.hostPath,
                                 Target: v.containerPath,
@@ -1327,13 +1562,14 @@ class DockerApi {
                                 ReadOnly: false,
                                 Consistency: 'default',
                             })
-                        } else if (!!v.volumeName) {
+                        } else if (v.volumeName) {
                             // named volumes are created here:
                             // /var/lib/docker/volumes/YOUR_VOLUME_NAME/_data
                             mts.push({
                                 Source:
-                                    (namespace ? namespace + '--' : '') +
-                                    v.volumeName,
+                                    (namespace && appObject?.isLegacyAppName
+                                        ? namespace + '--'
+                                        : '') + v.volumeName,
                                 Target: v.containerPath,
                                 Type: VolumesTypes.VOLUME,
                                 ReadOnly: false,
@@ -1346,11 +1582,25 @@ class DockerApi {
                 }
 
                 if (networks) {
-                    updatedData.TaskTemplate.Networks = []
-                    for (let i = 0; i < networks.length; i++) {
-                        updatedData.TaskTemplate.Networks.push({
-                            Target: networks[i],
-                        })
+                    if (appObject) {
+                        const legacyDnsAlias = getLegacyServiceDnsAlias(
+                            serviceName,
+                            namespace,
+                            !!appObject.isLegacyAppName
+                        )
+
+                        updatedData.TaskTemplate.Networks =
+                            getServiceNetworkAttachments(
+                                networks,
+                                legacyDnsAlias
+                            )
+                    } else {
+                        updatedData.TaskTemplate.Networks = []
+                        for (let i = 0; i < networks.length; i++) {
+                            updatedData.TaskTemplate.Networks.push({
+                                Target: networks[i],
+                            })
+                        }
                     }
                 }
 
@@ -1383,7 +1633,7 @@ class DockerApi {
                                 Name: obj.secretName,
                                 UID: '0',
                                 GID: '0',
-                                Mode: 292, // TODO << what is this! I just added a secret and this is how it came out with... But I don't know what it means
+                                Mode: 0o444, // Read-only for owner, group, and others
                             },
                             SecretID: obj.secretId,
                             SecretName: obj.secretName,
@@ -1406,11 +1656,11 @@ class DockerApi {
 
                     switch (updateOrder) {
                         case IDockerUpdateOrders.AUTO:
-                            const existingVols =
-                                updatedData.TaskTemplate.ContainerSpec.Mounts ||
-                                []
                             updatedData.UpdateConfig.Order =
-                                existingVols.length > 0
+                                (
+                                    updatedData.TaskTemplate.ContainerSpec
+                                        .Mounts || []
+                                ).length > 0
                                     ? 'stop-first'
                                     : 'start-first'
                             break
@@ -1421,7 +1671,8 @@ class DockerApi {
                             updatedData.UpdateConfig.Order = 'stop-first'
                             break
                         default:
-                            let neverHappens: never = updateOrder
+                            // eslint-disable-next-line
+                            const neverHappens: never = updateOrder
                             throw new Error(
                                 `Unknown update order! ${updateOrder}${neverHappens}`
                             )
@@ -1437,7 +1688,8 @@ class DockerApi {
                 // to restart once. Once rebooted, all changes start showing up.
                 updatedData.TaskTemplate.ContainerSpec.Labels =
                     updatedData.TaskTemplate.ContainerSpec.Labels || {}
-                updatedData.TaskTemplate.ContainerSpec.Labels.randomLabelForceUpdate = uuid()
+                updatedData.TaskTemplate.ContainerSpec.Labels.randomLabelForceUpdate =
+                    uuid()
 
                 updatedData.authconfig = authObject
 
@@ -1476,12 +1728,10 @@ class DockerApi {
                     (instanceCount && instanceCount > 0) ||
                     instanceCount === 0
                 ) {
-                    if (!updatedData.Mode.Replicated) {
-                        throw new Error(
-                            'Non replicated services cannot be associated with instance count'
-                        )
+                    // assign instance count as replicas for replicated mode services, not for global mode services
+                    if (updatedData.Mode.Replicated) {
+                        updatedData.Mode.Replicated.Replicas = instanceCount
                     }
-                    updatedData.Mode.Replicated.Replicas = instanceCount
                 }
 
                 return Utils.mergeObjects(updatedData, serviceUpdateOverride)
@@ -1495,6 +1745,9 @@ class DockerApi {
                 return updatedData
             })
             .then(function (updatedData) {
+                updatedData.Labels = updatedData.Labels || {}
+                updatedData.Labels[CAPROVER_MANAGED_SERVICE_LABEL] = 'true'
+
                 return self.dockerode
                     .getService(serviceName)
                     .update(updatedData)
@@ -1546,8 +1799,9 @@ class DockerApi {
                     .logs({
                         tail: tailCount,
                         follow: false,
-                        timestamps: !!CaptainConstants.configs
-                            .enableDockerLogsTimestamp,
+                        timestamps:
+                            !!CaptainConstants.configs
+                                .enableDockerLogsTimestamp,
                         stdout: true,
                         stderr: true,
                     })
@@ -1668,17 +1922,48 @@ const connectionParams: Docker.DockerOptions =
               socketPath: CaptainConstants.dockerSocketPath,
           }
         : dockerApiAddressSplited.length === 2
-        ? {
-              host: dockerApiAddressSplited[0],
-              port: Number(dockerApiAddressSplited[1]),
-          }
-        : {
-              host: `${dockerApiAddressSplited[0]}:${dockerApiAddressSplited[1]}`,
-              port: Number(dockerApiAddressSplited[2]),
-          }
+          ? {
+                host: dockerApiAddressSplited[0],
+                port: Number(dockerApiAddressSplited[1]),
+            }
+          : {
+                host: `${dockerApiAddressSplited[0]}:${dockerApiAddressSplited[1]}`,
+                port: Number(dockerApiAddressSplited[2]),
+            }
 
 connectionParams.version = CaptainConstants.configs.dockerApiVersion
-
 const dockerApiInstance = new DockerApi(connectionParams)
+
+const lowVersionDocker = JSON.parse(JSON.stringify(connectionParams))
+lowVersionDocker.version = 'v1.44'
+
+new Docker(lowVersionDocker)
+    .version()
+    .then((data) => {
+        Logger.d('Docker API Version on host: ' + data.ApiVersion)
+
+        const majorSupported = Number(data.ApiVersion.split('.')[0])
+        const minorSupported = Number(data.ApiVersion.split('.')[1])
+        const majorNeeded = Number(
+            CaptainConstants.configs.dockerApiVersion
+                .replace('v', '')
+                .split('.')[0]
+        )
+        const minorNeeded = Number(
+            CaptainConstants.configs.dockerApiVersion
+                .replace('v', '')
+                .split('.')[1]
+        )
+
+        if (
+            majorSupported < majorNeeded ||
+            (majorSupported === majorNeeded && minorSupported < minorNeeded)
+        ) {
+            dockerApiInstance.dockerNeedsUpdate = true
+        }
+    })
+    .catch((error) => {
+        Logger.e('Docker API Version Error: ' + error)
+    })
 
 export default DockerApi

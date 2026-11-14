@@ -2,7 +2,22 @@ import fs = require('fs-extra')
 import path = require('path')
 import EnvVars from './EnvVars'
 
-const CAPTAIN_BASE_DIRECTORY = '/captain'
+const RELEASE_CONFIG_CONTENT = fs.readFileSync(
+    path.join(__dirname, '../../release/release.conf'),
+    'utf8'
+)
+
+function getReleaseConfigValue(key: string) {
+    const match = new RegExp(`^${key}=([^\\r\\n]+)$`, 'm').exec(
+        RELEASE_CONFIG_CONTENT
+    )
+    if (!match) {
+        throw new Error(`Missing release config value: ${key}`)
+    }
+    return match[1]
+}
+
+const CAPTAIN_BASE_DIRECTORY = EnvVars.CAPTAIN_BASE_DIRECTORY || '/captain'
 const CAPTAIN_DATA_DIRECTORY = CAPTAIN_BASE_DIRECTORY + '/data' // data that sits here can be backed up
 const CAPTAIN_ROOT_DIRECTORY_TEMP = CAPTAIN_BASE_DIRECTORY + '/temp'
 const CAPTAIN_ROOT_DIRECTORY_GENERATED = CAPTAIN_BASE_DIRECTORY + '/generated'
@@ -15,11 +30,13 @@ const CONSTANT_FILE_OVERRIDE_USER =
     CAPTAIN_DATA_DIRECTORY + '/config-override.json'
 
 const configs = {
-    publishedNameOnDockerHub: 'caprover/caprover',
+    publishedNameOnDockerHub: getReleaseConfigValue('CAPROVER_IMAGE_NAME'),
 
-    version: '1.9.0',
+    version: getReleaseConfigValue('CAPROVER_VERSION'),
 
     defaultMaxLogSize: '512m',
+
+    defaultDockerBuildVersion: '2' as '1' | '2',
 
     buildLogSize: 50,
 
@@ -33,22 +50,64 @@ const configs = {
 
     registrySubDomainPort: 996,
 
-    dockerApiVersion: 'v1.40',
+    dockerApiVersion: 'v1.44',
 
-    netDataImageName: 'caprover/netdata:v1.8.0',
+    netDataImageName: 'caprover/netdata:v1.34.1',
+
+    goAccessImageName: 'caprover/goaccess:1.9.4',
+
+    goAccessAnonymizeIP: false,
 
     registryImageName: 'registry:2',
 
     appPlaceholderImageName: 'caprover/caprover-placeholder-app:latest',
 
-    nginxImageName: 'nginx:1',
+    nginxImageName: 'nginx:1.31',
 
     defaultEmail: 'runner@caprover.com',
 
     captainSubDomain: 'captain',
+
+    overlayNetworkOverride: {},
+
+    useExistingSwarm: false,
+
+    proApiDomains: ['https://pro.caprover.com'],
+
+    analyticsDomain: 'https://analytics-v1.caprover.com',
+
+    certbotImageName: 'caprover/certbot-sleeping:v2.11.0',
+
+    certbotCertCommandRules: undefined as CertbotCertCommandRule[] | undefined,
+
+    // this is added in 1.13 just as a safety - remove this after 1.14
+    disableEncryptedCheck: false,
+
+    // The port can be overridden via env variable CAPTAIN_HOST_HTTP_PORT
+    nginxPortNumber80: EnvVars.CAPTAIN_HOST_HTTP_PORT,
+    // The port can be overridden via env variable CAPTAIN_HOST_HTTPS_PORT
+    nginxPortNumber443: EnvVars.CAPTAIN_HOST_HTTPS_PORT,
+    // The port can be overridden via env variable CAPTAIN_HOST_ADMIN_PORT
+    adminPortNumber3000: EnvVars.CAPTAIN_HOST_ADMIN_PORT,
+
+    defaultGzipOn: true,
+
+    defaultGzipTypes:
+        'application/atom+xml application/geo+json application/javascript application/x-javascript application/json application/ld+json application/manifest+json application/rdf+xml application/rss+xml application/xhtml+xml application/xml font/eot font/otf font/ttf font/woff2 image/svg+xml text/css text/html text/javascript text/plain text/xml',
 }
 
-let data = {
+export interface CertbotCertCommandRule {
+    /**
+     * Matches both *.<domain> and <domain>, use '*' to match all domains
+     */
+    domain: string
+    /**
+     * The Certbot command to execute, will be parsed using `shell-quote`, available variables are `${domainName}` and `${subdomain}`
+     */
+    command?: string
+}
+
+const data = {
     configs: configs, // values that can be overridden
 
     // ******************** Global Constants *********************
@@ -57,7 +116,7 @@ let data = {
 
     isDebug: EnvVars.CAPTAIN_IS_DEBUG,
 
-    captainServiceExposedPort: 3000,
+    serviceContainerPort3000: 3000,
 
     rootNameSpace: 'captain',
 
@@ -78,6 +137,10 @@ let data = {
     nginxDhParamFileName: 'dhparam.pem',
 
     nginxDefaultHtmlDir: '/default',
+
+    nginxSharedLogsPath: '/var/log/nginx-shared',
+
+    goAccessCrontabPath: '/var/spool/cron/crontabs/root',
 
     letsEncryptEtcPathOnNginx: '/letencrypt/etc',
 
@@ -111,6 +174,8 @@ let data = {
     perAppNginxConfigPathBase:
         CAPTAIN_ROOT_DIRECTORY_GENERATED + '/nginx/conf.d',
 
+    goaccessConfigPathBase: CAPTAIN_ROOT_DIRECTORY_GENERATED + '/goaccess',
+
     captainDataDirectory: CAPTAIN_DATA_DIRECTORY,
 
     letsEncryptLibPath: CAPTAIN_DATA_DIRECTORY + '/letencrypt/lib',
@@ -121,11 +186,11 @@ let data = {
 
     nginxSharedPathOnHost: CAPTAIN_DATA_DIRECTORY + '/nginx-shared',
 
+    nginxSharedLogsPathOnHost: CAPTAIN_DATA_DIRECTORY + '/shared-logs',
+
     debugSourceDirectory: '', // Only used in debug mode
 
     // ********************* Local Docker Constants  ************************
-
-    certbotImageName: 'caprover/certbot-sleeping:v1.6.0',
 
     captainSaltSecretKey: 'captain-salt',
 
@@ -134,6 +199,8 @@ let data = {
     captainServiceName: 'captain-captain',
 
     certbotServiceName: 'captain-certbot',
+
+    goAccessContainerName: 'captain-goaccess-container',
 
     netDataContainerName: 'captain-netdata-container',
 
@@ -144,8 +211,6 @@ let data = {
     captainRegistryUsername: 'captain',
 
     // ********************* HTTP Related Constants  ************************
-
-    nginxPortNumber: 80,
 
     netDataRelativePath: '/net-data-monitor',
 
@@ -161,38 +226,47 @@ let data = {
 
     headerNamespace: 'x-namespace',
 
+    headerCapRoverVersion: 'x-caprover-version',
+
     // *********************     ETC       ************************
 
     disableFirewallCommand:
-        'ufw allow 80,443,3000,996,7946,4789,2377/tcp; ufw allow 7946,4789,2377/udp; ',
+        'ufw allow ' +
+        configs.nginxPortNumber80 +
+        ',' +
+        configs.nginxPortNumber443 +
+        ',' +
+        configs.adminPortNumber3000 +
+        ',996,7946,4789,2377/tcp; ufw allow 7946,4789,2377/udp; ',
 
     gitShaEnvVarKey: 'CAPROVER_GIT_COMMIT_SHA',
 }
 
-function overrideFromFile(fileName: string) {
-    let overridingValuesConfigs = fs.readJsonSync(fileName, {
+function overrideConfigFromFile(fileName: string) {
+    const overridingValuesConfigs = fs.readJsonSync(fileName, {
         throws: false,
     })
 
-    if (!!overridingValuesConfigs) {
-        for (let prop in overridingValuesConfigs) {
+    if (overridingValuesConfigs) {
+        for (const prop in overridingValuesConfigs) {
+            // eslint-disable-next-line no-prototype-builtins
             if (!overridingValuesConfigs.hasOwnProperty(prop)) {
                 continue
             }
 
             console.log(`Overriding ${prop} from ${fileName}`)
-            // @ts-ignore
+            // @ts-expect-error "this actually works"
             configs[prop] = overridingValuesConfigs[prop]
         }
     }
 }
 
-overrideFromFile(CONSTANT_FILE_OVERRIDE_BUILD)
+overrideConfigFromFile(CONSTANT_FILE_OVERRIDE_BUILD)
 
-overrideFromFile(CONSTANT_FILE_OVERRIDE_USER)
+overrideConfigFromFile(CONSTANT_FILE_OVERRIDE_USER)
 
 if (data.isDebug) {
-    let devDirectoryOnLocalMachine = fs
+    const devDirectoryOnLocalMachine = fs
         .readFileSync(__dirname + '/../../currentdirectory')
         .toString()
         .trim()
@@ -205,7 +279,7 @@ if (data.isDebug) {
 
     data.debugSourceDirectory = devDirectoryOnLocalMachine
     data.configs.publishedNameOnDockerHub = 'captain-debug'
-    data.nginxPortNumber = 80
+    // data.configs.nginxPortNumber80 = 80
 }
 
 export default data

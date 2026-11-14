@@ -1,19 +1,25 @@
 name: Run lint
 
 on:
-  push:
-    branches:
-      - master
-  pull_request:
-    branches:
-      - master
+    workflow_dispatch:
+    push:
+        branches:
+            - master
+    pull_request:
+        branches:
+            - master
+            - release
 
 jobs:
-  run-tslint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v1
-      - uses: actions/setup-node@v1
-        with:
-          node-version: 10
-      - run: npm ci && npm run tslint
+    run-lint:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v5
+              with:
+                  node-version: 24
+            - run: |
+                  sudo bash -c "mkdir /captain && chown -R `whoami` /captain"
+                  npm ci
+                  npm run lint
+                  npm run test

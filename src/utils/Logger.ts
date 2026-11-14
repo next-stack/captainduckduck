@@ -1,6 +1,6 @@
 import { AnyError } from '../models/OtherTypes'
 import CaptainConstants from './CaptainConstants'
-const moment = require('moment')
+import { formatLogDate } from './DateUtils'
 
 function errorize(error: AnyError) {
     if (!(error instanceof Error)) {
@@ -11,7 +11,7 @@ function errorize(error: AnyError) {
 }
 
 function getTime() {
-    return `[36m${moment().format('MMMM Do YYYY, h:mm:ss.SSS a    ')}[0m`
+    return `[36m${formatLogDate(new Date())}[0m`
 }
 
 class Logger {
@@ -29,9 +29,9 @@ class Logger {
         }
     }
 
-    static e(msgOrError: AnyError) {
-        let err = errorize(msgOrError)
-        console.error(`${getTime() + err}
+    static e(msgOrError: AnyError, message?: string) {
+        const err = errorize(msgOrError)
+        console.error(`${getTime() + ((message || '') + '\n') + err}
 ${err.stack}`)
     }
 }

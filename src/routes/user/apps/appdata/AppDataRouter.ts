@@ -1,8 +1,8 @@
 import express = require('express')
 import ApiStatusCodes from '../../../../api/ApiStatusCodes'
 import BaseApi from '../../../../api/BaseApi'
+import { uploadCaptainDefinitionContent as uploadCaptainDefinitionContentHandler } from '../../../../handlers/users/apps/appdata/AppDataHandler'
 import InjectionExtractor from '../../../../injection/InjectionExtractor'
-import Logger from '../../../../utils/Logger'
 import multer = require('multer')
 
 const TEMP_UPLOAD = 'temp_upload/'
@@ -12,9 +12,9 @@ const upload = multer({
 })
 
 router.get('/:appName/logs', function (req, res, next) {
-    let appName = req.params.appName
-    const serviceManager = InjectionExtractor.extractUserFromInjected(res).user
-        .serviceManager
+    const appName = req.params.appName
+    const serviceManager =
+        InjectionExtractor.extractUserFromInjected(res).user.serviceManager
 
     return Promise.resolve()
         .then(function () {
@@ -25,7 +25,7 @@ router.get('/:appName/logs', function (req, res, next) {
             )
         })
         .then(function (logs) {
-            let baseApi = new BaseApi(
+            const baseApi = new BaseApi(
                 ApiStatusCodes.STATUS_OK,
                 'App runtime logs are retrieved'
             )
@@ -36,16 +36,16 @@ router.get('/:appName/logs', function (req, res, next) {
 })
 
 router.get('/:appName/', function (req, res, next) {
-    let appName = req.params.appName
-    const serviceManager = InjectionExtractor.extractUserFromInjected(res).user
-        .serviceManager
+    const appName = req.params.appName
+    const serviceManager =
+        InjectionExtractor.extractUserFromInjected(res).user.serviceManager
 
     return Promise.resolve()
         .then(function () {
             return serviceManager.getBuildStatus(appName)
         })
         .then(function (data) {
-            let baseApi = new BaseApi(
+            const baseApi = new BaseApi(
                 ApiStatusCodes.STATUS_OK,
                 'App build status retrieved'
             )
@@ -56,11 +56,11 @@ router.get('/:appName/', function (req, res, next) {
 })
 
 router.post('/:appName/', function (req, res, next) {
-    const dataStore = InjectionExtractor.extractUserFromInjected(res).user
-        .dataStore
-    let appName = req.params.appName
+    const dataStore =
+        InjectionExtractor.extractUserFromInjected(res).user.dataStore
+    const appName = req.params.appName
 
-    dataStore
+    return dataStore
         .getAppsDataStore()
         .getAppDefinition(appName)
         .then(function (app) {
@@ -70,74 +70,37 @@ router.post('/:appName/', function (req, res, next) {
         .catch(ApiStatusCodes.createCatcher(res))
 })
 
-router.post(
+// uploadCaptainDefinitionContent
+router.post<{ appName: string }>(
     '/:appName/',
     upload.single('sourceFile'),
     function (req, res, next) {
-        const serviceManager = InjectionExtractor.extractUserFromInjected(res)
-            .user.serviceManager
+        const serviceManager =
+            InjectionExtractor.extractUserFromInjected(res).user.serviceManager
 
         const appName = req.params.appName
         const isDetachedBuild = !!req.query.detached
-        const captainDefinitionContent =
-            (req.body.captainDefinitionContent || '') + ''
-        const gitHash = (req.body.gitHash || '') + ''
-        let tarballSourceFilePath: string = !!req.file ? req.file.path : ''
+        const captainDefinitionContent = `${req.body.captainDefinitionContent || ''}`
+        const gitHash = `${req.body.gitHash || ''}`
+        const tarballSourceFilePath: string = req.file ? req.file.path : ''
 
-        if (!!tarballSourceFilePath === !!captainDefinitionContent) {
-            res.send(
-                new BaseApi(
-                    ApiStatusCodes.ILLEGAL_OPERATION,
-                    'Either tarballfile or captainDefinitionContent should be present.'
-                )
-            )
-            return
-        }
-
-        Promise.resolve().then(function () {
-            const promiseToDeployNewVer = serviceManager.scheduleDeployNewVersion(
+        return uploadCaptainDefinitionContentHandler(
+            {
                 appName,
-                {
-                    uploadedTarPathSource: !!tarballSourceFilePath
-                        ? {
-                              uploadedTarPath: tarballSourceFilePath,
-                              gitHash,
-                          }
-                        : undefined,
-                    captainDefinitionContentSource: !!captainDefinitionContent
-                        ? {
-                              captainDefinitionContent,
-                              gitHash,
-                          }
-                        : undefined,
-                }
-            )
-
-            if (isDetachedBuild) {
-                res.send(
-                    new BaseApi(
-                        ApiStatusCodes.STATUS_OK_DEPLOY_STARTED,
-                        'Deploy is started'
-                    )
-                )
-
-                // To avoid unhandled promise error
-                promiseToDeployNewVer.catch(function (err) {
-                    Logger.e(err)
-                })
-            } else {
-                promiseToDeployNewVer
-                    .then(function () {
-                        res.send(
-                            new BaseApi(
-                                ApiStatusCodes.STATUS_OK,
-                                'Deploy is done'
-                            )
-                        )
-                    })
-                    .catch(ApiStatusCodes.createCatcher(res))
-            }
-        })
+                isDetachedBuild,
+                captainDefinitionContent: captainDefinitionContent || undefined,
+                gitHash: gitHash || undefined,
+                uploadedTarPathSource: tarballSourceFilePath || undefined,
+            },
+            serviceManager
+        )
+            .then(function (result) {
+                const status = isDetachedBuild
+                    ? ApiStatusCodes.STATUS_OK_DEPLOY_STARTED
+                    : ApiStatusCodes.STATUS_OK
+                res.send(new BaseApi(status, result.message))
+            })
+            .catch(ApiStatusCodes.createCatcher(res))
     }
 )
 

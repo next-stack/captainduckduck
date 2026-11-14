@@ -7,7 +7,6 @@
 /currentdirectory
 /node_modules
 /built
-/dist-frontend
 /captain-sample-apps
 
 # JetBrains
@@ -18,3 +17,6 @@ npm-debug.log
 
 
 .DS_Store
+
+.github
+.vscode

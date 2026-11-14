@@ -9,7 +9,9 @@ import { AnyError } from './models/OtherTypes'
 import CaptainConstants from './utils/CaptainConstants'
 import * as CaptainInstaller from './utils/CaptainInstaller'
 import EnvVars from './utils/EnvVars'
-const debug = require('debug')('caprover:server')
+import debugModule = require('debug')
+
+const debug = debugModule('caprover:server')
 
 function startServer() {
     if (CaptainConstants.isDebug) {
@@ -28,7 +30,7 @@ function startServer() {
      * Get port from environment and store in Express.
      */
 
-    const port = normalizePort(process.env.PORT || '3000')
+    const port = CaptainConstants.serviceContainerPort3000
     app.set('port', port)
 
     /**
@@ -44,26 +46,6 @@ function startServer() {
     server.listen(port)
     server.on('error', onError)
     server.on('listening', onListening)
-
-    /**
-     * Normalize a port into a number, string, or false.
-     */
-
-    function normalizePort(val: string) {
-        const port = parseInt(val, 10)
-
-        if (isNaN(port)) {
-            // named pipe
-            return val
-        }
-
-        if (port >= 0) {
-            // port number
-            return port
-        }
-
-        return false
-    }
 
     /**
      * Event listener for HTTP server "error" event.
